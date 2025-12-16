@@ -27,7 +27,7 @@ class TargetInfo:
 class StateMachine:
     """状态机控制器"""
     
-    def __init__(self, lost_timeout_frames: int = 60, gesture_hold_duration: float = 3.0, gesture_cooldown_seconds: float = 10.0):
+    def __init__(self, lost_timeout_frames: int = 60, gesture_hold_duration: float = 3.0, gesture_cooldown_seconds: float = 3.0):
         self.state = SystemState.IDLE
         self.target = TargetInfo()
         self.lost_timeout_frames = lost_timeout_frames
@@ -35,10 +35,10 @@ class StateMachine:
         # 状态变更回调
         self._on_state_change: Optional[Callable] = None
         
-        # 手势防抖: 防止同一手势连续触发
+        # 手势防抖: 防止同一手势连续触发 (使用时间戳，不受帧率影响)
         self._last_gesture = GestureType.NONE
-        self._gesture_cooldown = 0  # 冷却帧数
-        self._cooldown_frames = int(gesture_cooldown_seconds * 30)  # 按30fps计算，默认10秒=300帧
+        self._cooldown_seconds = gesture_cooldown_seconds  # 冷却时间 (秒)
+        self._cooldown_end_time = 0.0  # 冷却结束时间戳
         
         # 状态转换规则
         self._transitions: Dict[SystemState, Dict[str, SystemState]] = {
@@ -76,14 +76,11 @@ class StateMachine:
         if current_time is None:
             current_time = time.time()
         
-        # 更新冷却
-        if self._gesture_cooldown > 0:
-            self._gesture_cooldown -= 1
+        # 检查冷却 (使用时间戳)
+        if current_time < self._cooldown_end_time:
             if debug:
-                print(f"[SM] 冷却中: {self._gesture_cooldown}")
-        
-        # 冷却中不处理任何手势
-        if self._gesture_cooldown > 0:
+                remaining = self._cooldown_end_time - current_time
+                print(f"[SM] 冷却中: 剩余 {remaining:.1f}s")
             return False
         
         if gesture == GestureType.NONE:
@@ -128,7 +125,7 @@ class StateMachine:
                         print(f"[SM] 持续时间足够! 触发 Toggle")
                     self._gesture_start_time = None
                     self._current_holding_gesture = GestureType.NONE
-                    self._gesture_cooldown = self._cooldown_frames
+                    self._cooldown_end_time = current_time + self._cooldown_seconds  # 设置冷却结束时间
                     
                     # Toggle: 空闲->启动, 跟踪->停止
                     if self.state == SystemState.IDLE:

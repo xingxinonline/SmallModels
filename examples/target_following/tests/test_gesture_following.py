@@ -45,7 +45,7 @@ from core.state_machine import StateMachine
 
 # 手势配置
 GESTURE_HOLD_DURATION = 3.0  # 触发需要保持的秒数
-GESTURE_COOLDOWN_SECONDS = 10.0  # 触发后冷却秒数 (防止连续触发)
+GESTURE_COOLDOWN_SECONDS = 3.0  # 触发后冷却秒数 (防止连续触发)
 
 
 def extract_view_feature(

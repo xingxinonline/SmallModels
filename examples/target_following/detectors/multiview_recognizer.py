@@ -37,7 +37,7 @@ class MultiViewTarget:
     """多视角目标特征库"""
     # 视角特征列表 (最多保存 N 个不同角度)
     view_features: List[ViewFeature] = field(default_factory=list)
-    max_views: int = 5
+    max_views: int = 10  # 默认存储10个视角
     
     # 运动历史 (用于一致性检查)
     position_history: deque = field(default_factory=lambda: deque(maxlen=30))
