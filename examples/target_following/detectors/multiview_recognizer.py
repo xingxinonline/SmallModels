@@ -29,6 +29,12 @@ class ViewFeature:
     
     @property
     def is_valid(self) -> bool:
+        """有人脸embedding或人体颜色直方图，即为有效"""
+        return self.part_color_hists is not None or (self.has_face and self.face_embedding is not None)
+    
+    @property
+    def has_body(self) -> bool:
+        """是否有人体特征"""
         return self.part_color_hists is not None
 
 
@@ -99,25 +105,37 @@ class MultiViewTarget:
         return True
     
     def _compute_view_similarity(self, v1: ViewFeature, v2: ViewFeature) -> float:
-        """计算两个视角的相似度"""
-        if v1.part_color_hists is None or v2.part_color_hists is None:
-            return 0.0
+        """
+        计算两个视角的相似度
         
-        sims = []
-        num_parts = min(len(v1.part_color_hists), len(v2.part_color_hists))
+        优先使用人脸特征比较（如果都有），否则使用人体颜色直方图
+        """
+        # 1. 如果都有人脸特征，使用人脸相似度
+        if (v1.has_face and v1.face_embedding is not None and 
+            v2.has_face and v2.face_embedding is not None):
+            face_sim = float(np.dot(v1.face_embedding, v2.face_embedding))
+            return face_sim
         
-        for i in range(num_parts):
-            h1 = v1.part_color_hists[i].astype(np.float32)
-            h2 = v2.part_color_hists[i].astype(np.float32)
+        # 2. 如果都有人体特征，使用颜色直方图相似度
+        if v1.part_color_hists is not None and v2.part_color_hists is not None:
+            sims = []
+            num_parts = min(len(v1.part_color_hists), len(v2.part_color_hists))
             
-            if h1.sum() < 1e-8 or h2.sum() < 1e-8:
-                sims.append(0.5)
-                continue
+            for i in range(num_parts):
+                h1 = v1.part_color_hists[i].astype(np.float32)
+                h2 = v2.part_color_hists[i].astype(np.float32)
+                
+                if h1.sum() < 1e-8 or h2.sum() < 1e-8:
+                    sims.append(0.5)
+                    continue
+                
+                bc = cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA)
+                sims.append(1.0 - bc)
             
-            bc = cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA)
-            sims.append(1.0 - bc)
+            return float(np.mean(sims))
         
-        return float(np.mean(sims))
+        # 3. 一个有人脸一个只有人体，视为不同视角
+        return 0.0
     
     def update_position(self, bbox: np.ndarray) -> None:
         """更新位置历史"""

@@ -128,9 +128,11 @@ class StateMachine:
                     self._cooldown_end_time = current_time + self._cooldown_seconds  # 设置冷却结束时间
                     
                     # Toggle: 空闲->启动, 跟踪->停止
+                    # 注意：LOST_TARGET 状态不能直接停止，必须先找回目标或超时
                     if self.state == SystemState.IDLE:
                         return self._trigger("start")
-                    elif self.state in [SystemState.TRACKING, SystemState.LOST_TARGET]:
+                    elif self.state == SystemState.TRACKING:
+                        # 只有在正常跟踪状态才能停止
                         return self._trigger("stop")
         
         elif gesture == GestureType.VICTORY:

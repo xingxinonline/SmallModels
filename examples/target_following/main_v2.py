@@ -363,7 +363,7 @@ class TargetFollowingSystem:
                                 target_person = self._find_person_for_face(target_face, cached_person_detections)
                                 person_feature = None
                                 if target_person and target_person.keypoints is not None:
-                                    person_feature = self.person_detector.compute_person_feature(frame, target_person)
+                                    person_feature = self.person_detector.compute_person_feature(target_person.keypoints)
                                 
                                 # 锁定
                                 self.state_machine.lock_target(target_feature, person_feature)
