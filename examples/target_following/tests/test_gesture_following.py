@@ -84,8 +84,8 @@ RELOCK_FACE_THRESHOLD = 0.70
 RELOCK_CONFIRM_FRAMES = 2
 AUTO_LEARN_CONFIRM_FRAMES = 1
 
-# 视角库最大容量
-MAX_VIEW_COUNT = 8
+# 视角库最大容量（有脸3-4 + 无脸2 = 侧身+背面）
+MAX_VIEW_COUNT = 6
 
 # 人脸有效尺寸（匹配用）
 MIN_FACE_SIZE = 40
@@ -111,13 +111,43 @@ def evaluate_face_quality(face_conf: float, face_size: int, face_sim: float) -> 
     """
     评估人脸质量，返回状态: 'stable', 'unstable', 'lost'
     
-    stable: 高置信度、大尺寸、高相似度 → 纯人脸跟随
+    stable: 高置信度+大尺寸，或 超大尺寸可弥补低置信度，或 高相似度可弥补
     unstable: 中等质量 → motion辅助判断
     lost: 低质量或无人脸 → 切换到人体+motion
+    
+    关键改进：
+    1. 大尺寸人脸（>=100px）即使置信度较低也应视为stable
+    2. 高相似度（>=0.60）可以弥补小尺寸/低置信度（说明embedding质量好）
     """
     if face_conf is None or face_size is None:
         return 'lost'
     
+    # 关键改进：高相似度说明 embedding 质量好，可以提升评级
+    # 即使人脸小/检测置信度低，高相似度也说明是同一个人
+    HIGH_SIM_THRESHOLD = 0.60
+    MEDIUM_SIM_THRESHOLD = 0.45
+    
+    if face_sim is not None and face_sim >= HIGH_SIM_THRESHOLD:
+        # 高相似度：只要尺寸不是太小（>=20px）就算 stable
+        if face_size >= 20:
+            return 'stable'
+    
+    if face_sim is not None and face_sim >= MEDIUM_SIM_THRESHOLD:
+        # 中等相似度：只要尺寸不是太小（>=20px）就算 unstable
+        if face_size >= 20:
+            return 'unstable'
+    
+    # 大尺寸人脸可以弥补低置信度
+    # size >= 100px 时，只要 conf >= 0.50 就算 stable
+    LARGE_FACE_SIZE = 100
+    LARGE_FACE_MIN_CONF = 0.50
+    
+    if face_size >= LARGE_FACE_SIZE and face_conf >= LARGE_FACE_MIN_CONF:
+        # 大尺寸人脸：只要相似度不太低就算stable
+        if face_sim is None or face_sim >= FACE_UNSTABLE_SIM:
+            return 'stable'
+    
+    # 正常判断
     if (face_conf >= FACE_STABLE_CONF and 
         face_size >= FACE_STABLE_SIZE and 
         (face_sim is None or face_sim >= FACE_STABLE_SIM)):
@@ -439,12 +469,55 @@ def main():
         faces = face_detector.detect(frame)
         gesture = gesture_detector.detect(frame)
         
+        # ============== 手势有效性过滤 ==============
+        # 1. 手势必须足够大（避免误识别远处的小手势）
+        # 2. 优先识别屏幕中央区域的手势
+        MIN_HAND_SIZE_FOR_GESTURE = 30  # 手势最小像素尺寸（降低到30px）
+        CENTER_REGION_RATIO = 0.85  # 中央区域占比（扩大到85%）
+        
+        gesture_valid = False
+        gesture_reject_reason = None
+        
+        if gesture.hand_bbox is not None and gesture.gesture_type in (GestureType.OPEN_PALM, GestureType.CLOSED_FIST):
+            hx1, hy1, hx2, hy2 = gesture.hand_bbox
+            hand_w = hx2 - hx1
+            hand_h = hy2 - hy1
+            hand_size = min(hand_w, hand_h)
+            hand_center = ((hx1 + hx2) / 2, (hy1 + hy2) / 2)
+            
+            # 检查1：手势尺寸
+            if hand_size < MIN_HAND_SIZE_FOR_GESTURE:
+                gesture_reject_reason = f"手势太小({hand_size:.0f}px<{MIN_HAND_SIZE_FOR_GESTURE}px)"
+            else:
+                # 检查2：手势是否在中央区域
+                center_x_min = w * (1 - CENTER_REGION_RATIO) / 2
+                center_x_max = w * (1 + CENTER_REGION_RATIO) / 2
+                center_y_min = h * (1 - CENTER_REGION_RATIO) / 2
+                center_y_max = h * (1 + CENTER_REGION_RATIO) / 2
+                
+                in_center = (center_x_min <= hand_center[0] <= center_x_max and 
+                            center_y_min <= hand_center[1] <= center_y_max)
+                
+                if in_center:
+                    gesture_valid = True
+                else:
+                    gesture_reject_reason = f"手势不在中央区域"
+        
+        # 如果手势无效，重置为 none
+        if not gesture_valid and gesture.gesture_type in (GestureType.OPEN_PALM, GestureType.CLOSED_FIST):
+            if gesture_reject_reason and frame_count % 30 == 0:
+                print(f"[DEBUG] 手势过滤: {gesture_reject_reason}")
+            # 创建一个无效手势结果
+            gesture = GestureResult(gesture_type=GestureType.NONE, confidence=0.0, hand_bbox=None)
+        
         # 调试日志 (每30帧输出一次)
         if frame_count % 30 == 0:
             print(f"[DEBUG] Frame {frame_count}: persons={len(persons)}, faces={len(faces)}, gesture={gesture.gesture_type.value}")
             if faces:
                 for i, face in enumerate(faces):
-                    print(f"        Face[{i}]: bbox={face.bbox.astype(int).tolist()}, conf={face.confidence:.2f}")
+                    fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+                    face_size = min(fx2-fx1, fy2-fy1)
+                    print(f"        Face[{i}]: bbox={[fx1,fy1,fx2,fy2]}, conf={face.confidence:.2f}, size={face_size}px")
             if persons:
                 for i, person in enumerate(persons):
                     print(f"        Person[{i}]: bbox={person.bbox.astype(int).tolist()}, conf={person.confidence:.2f}")
@@ -466,114 +539,187 @@ def main():
         # 状态变更处理
         if state_changed:
             if state_machine.state == SystemState.TRACKING and old_state == SystemState.IDLE:
-                # 启动跟随 - 优先锁定做手势的人，其次用最近的人
-                target_person = None
-                target_idx = -1
+                # ============================================
+                # 启动跟随 - 方案D：必须有人脸，可以没人体
+                # ============================================
+                # 优先级1: 有人体 + 手势在框内 + 框内有人脸 → 锁定
+                # 优先级2: 无人体 + 有人脸(质量够) → 锁定（直播场景）
+                # 其他情况 → 拒绝启动
+                # ============================================
                 
-                # 1. 优先找做手势的那个人
-                if gesture.hand_bbox is not None:
-                    print(f"[DEBUG] 手势框: {gesture.hand_bbox.astype(int).tolist()}")
-                    for pi, p in enumerate(persons):
-                        px1, py1, px2, py2 = p.bbox.astype(int)
-                        hc = ((gesture.hand_bbox[0] + gesture.hand_bbox[2]) / 2,
-                              (gesture.hand_bbox[1] + gesture.hand_bbox[3]) / 2)
-                        in_box = px1 <= hc[0] <= px2 and py1 <= hc[1] <= py2
-                        print(f"[DEBUG] Person[{pi}] bbox: [{px1}, {py1}, {px2}, {py2}], 手势在框内: {in_box}")
-                    gesture_person, gesture_idx = find_person_with_gesture(persons, gesture.hand_bbox)
-                    if gesture_person is not None:
-                        target_person = gesture_person
-                        target_idx = gesture_idx
-                        print(f"[DEBUG] 锁定做手势的人 Person[{target_idx}]")
-                    else:
-                        print(f"[DEBUG] 手势未落在任何人体框内或附近！")
+                MIN_FACE_CONF_FOR_START = 0.65  # 启动时人脸最低置信度
+                MIN_FACE_SIZE_FOR_START = 50    # 启动时人脸最小尺寸（标准）
+                MIN_FACE_SIZE_FOR_START_RELAXED = 30  # 高置信度时可放宽到30px
+                HIGH_CONF_FOR_RELAXED_SIZE = 0.75     # 置信度>=0.75时放宽尺寸要求
                 
-                # 2. 如果没找到，使用离画面中心最近的人
-                if target_person is None:
-                    target_person, target_idx = find_nearest_person(persons, frame_center)
-                    if target_person is not None:
-                        print(f"[DEBUG] 无法定位手势所在人体，使用最近的人 Person[{target_idx}]")
+                target_locked = False
                 
-                if target_person is not None:
-                    # 有人体检测结果
-                    print(f"[DEBUG] 锁定人体: bbox={target_person.bbox.astype(int).tolist()}")
-                    view = extract_view_feature(
-                        frame, target_person.bbox, faces, 
-                        face_recognizer, enhanced_reid
-                    )
-                    print(f"[DEBUG] 提取特征: has_face={view.has_face}, has_body={view.part_color_hists is not None}")
-                    if view.has_face and view.face_embedding is not None:
-                        print(f"[DEBUG] 人脸embedding: shape={view.face_embedding.shape}, norm={np.linalg.norm(view.face_embedding):.3f}")
-                    mv_recognizer.set_target(view, target_person.bbox)
-                    mv_recognizer.clear_match_history()  # 新目标，清空历史
-                    lost_frames = 0
-                    face_str = "有人脸" if view.has_face else "无人脸"
-                    print(f"[手势启动] 目标已锁定 (人体+{face_str})")
-                elif faces:
-                    # 没有人体但有人脸 - 用人脸框作为临时目标
-                    # 优先找离手势最近的人脸，其次找离画面中心最近的人脸
-                    target_face = None
+                # ========== 场景1: 有人体检测 ==========
+                if persons:
+                    target_person = None
+                    target_idx = -1
+                    face_in_target = None
                     
+                    # 1. 找手势所在的人体
                     if gesture.hand_bbox is not None:
-                        # 找离手势最近的人脸
-                        hx1, hy1, hx2, hy2 = gesture.hand_bbox
-                        hand_center = ((hx1 + hx2) / 2, (hy1 + hy2) / 2)
-                        min_dist = float('inf')
-                        for face in faces:
-                            fx1, fy1, fx2, fy2 = face.bbox
-                            fcx, fcy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
-                            dist = (fcx - hand_center[0])**2 + (fcy - hand_center[1])**2
-                            if dist < min_dist:
-                                min_dist = dist
-                                target_face = face
-                        if target_face is not None:
-                            print(f"[DEBUG] 仅人脸模式: 使用离手势最近的人脸")
+                        print(f"[DEBUG] 手势框: {gesture.hand_bbox.astype(int).tolist()}")
+                        for pi, p in enumerate(persons):
+                            px1, py1, px2, py2 = p.bbox.astype(int)
+                            hc = ((gesture.hand_bbox[0] + gesture.hand_bbox[2]) / 2,
+                                  (gesture.hand_bbox[1] + gesture.hand_bbox[3]) / 2)
+                            in_box = px1 <= hc[0] <= px2 and py1 <= hc[1] <= py2
+                            print(f"[DEBUG] Person[{pi}] bbox: [{px1}, {py1}, {px2}, {py2}], 手势在框内: {in_box}")
+                            
+                            if in_box:
+                                target_person = p
+                                target_idx = pi
+                                break
                     
-                    if target_face is None:
-                        # 找离画面中心最近的人脸
-                        min_dist = float('inf')
+                    if target_person is None:
+                        # 手势不在任何人体框内
+                        state_machine.state = SystemState.IDLE
+                        print("[提示] 手势未落在任何人体框内，请将手放在身体前方再做手势")
+                    else:
+                        # 2. 检查该人体框内是否有人脸
+                        px1, py1, px2, py2 = target_person.bbox.astype(int)
+                        best_face_in_person = None
+                        best_face_info = None
+                        
                         for face in faces:
-                            fx1, fy1, fx2, fy2 = face.bbox
-                            fcx, fcy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
-                            dist = (fcx - frame_center[0])**2 + (fcy - frame_center[1])**2
-                            if dist < min_dist:
-                                min_dist = dist
-                                target_face = face
+                            fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+                            fc_x, fc_y = (fx1 + fx2) // 2, (fy1 + fy2) // 2
+                            face_w, face_h = fx2 - fx1, fy2 - fy1
+                            face_size = min(face_w, face_h)
+                            
+                            # 检查人脸是否在人体框内
+                            if not (px1 <= fc_x <= px2 and py1 <= fc_y <= py2):
+                                continue
+                            
+                            # 记录这个人脸的信息用于调试
+                            best_face_info = {
+                                'conf': face.confidence,
+                                'size': face_size,
+                                'bbox': [fx1, fy1, fx2, fy2]
+                            }
+                            
+                            # 人脸中心在人体框内 + 质量达标
+                            # 高置信度(>=0.80)可接受更小尺寸(30px)
+                            size_ok = face_size >= MIN_FACE_SIZE_FOR_START
+                            size_ok_relaxed = (face.confidence >= HIGH_CONF_FOR_RELAXED_SIZE and 
+                                               face_size >= MIN_FACE_SIZE_FOR_START_RELAXED)
+                            
+                            if (face.confidence >= MIN_FACE_CONF_FOR_START and
+                                (size_ok or size_ok_relaxed)):
+                                face_in_target = face
+                                break
+                        
+                        if face_in_target is None:
+                            # 人体框内没有合格的人脸 - 打印详细调试信息
+                            state_machine.state = SystemState.IDLE
+                            if best_face_info:
+                                conf = best_face_info['conf']
+                                size = best_face_info['size']
+                                # 计算差距
+                                conf_gap = MIN_FACE_CONF_FOR_START - conf if conf < MIN_FACE_CONF_FOR_START else 0
+                                size_gap = MIN_FACE_SIZE_FOR_START - size if size < MIN_FACE_SIZE_FOR_START else 0
+                                size_gap_relaxed = MIN_FACE_SIZE_FOR_START_RELAXED - size if size < MIN_FACE_SIZE_FOR_START_RELAXED else 0
+                                
+                                print(f"[启动检测] 当前人脸: conf={conf:.2f}, size={size}px")
+                                print(f"           标准条件: conf>={MIN_FACE_CONF_FOR_START} ({'+' if conf>=MIN_FACE_CONF_FOR_START else '✗'}) + size>={MIN_FACE_SIZE_FOR_START}px ({'+' if size>=MIN_FACE_SIZE_FOR_START else '✗'})")
+                                print(f"           放宽条件: conf>={HIGH_CONF_FOR_RELAXED_SIZE} ({'+' if conf>=HIGH_CONF_FOR_RELAXED_SIZE else '✗'}) + size>={MIN_FACE_SIZE_FOR_START_RELAXED}px ({'+' if size>=MIN_FACE_SIZE_FOR_START_RELAXED else '✗'})")
+                                
+                                # 给出具体建议
+                                if conf < MIN_FACE_CONF_FOR_START:
+                                    print(f"           💡 建议: 正面朝向镜头 (conf差{conf_gap:.2f})")
+                                elif size < MIN_FACE_SIZE_FOR_START and conf < HIGH_CONF_FOR_RELAXED_SIZE:
+                                    print(f"           💡 建议: 靠近镜头 (size差{size_gap}px) 或正面朝向 (conf差{HIGH_CONF_FOR_RELAXED_SIZE-conf:.2f})")
+                                elif size < MIN_FACE_SIZE_FOR_START_RELAXED:
+                                    print(f"           💡 建议: 靠近镜头 (size差{size_gap_relaxed}px)")
+                            else:
+                                print(f"[启动检测] 人体框内未检测到人脸，请面对镜头")
+                        else:
+                            # 3. 锁定目标（人体+人脸）
+                            print(f"[DEBUG] 锁定 Person[{target_idx}]: bbox={target_person.bbox.astype(int).tolist()}")
+                            view = extract_view_feature(
+                                frame, target_person.bbox, faces, 
+                                face_recognizer, enhanced_reid
+                            )
+                            print(f"[DEBUG] 提取特征: has_face={view.has_face}, has_body={view.part_color_hists is not None}")
+                            if view.has_face and view.face_embedding is not None:
+                                print(f"[DEBUG] 人脸embedding: shape={view.face_embedding.shape}, norm={np.linalg.norm(view.face_embedding):.3f}")
+                                mv_recognizer.set_target(view, target_person.bbox)
+                                mv_recognizer.clear_match_history()
+                                lost_frames = 0
+                                target_locked = True
+                                print(f"[手势启动] 目标已锁定 (人体+人脸)")
+                            else:
+                                state_machine.state = SystemState.IDLE
+                                print("[提示] 人脸特征提取失败，请重试")
+                
+                # ========== 场景2: 无人体，仅人脸（直播场景）==========
+                elif faces:
+                    # 找最佳人脸
+                    best_face = None
+                    best_face_score = -1
                     
-                    if target_face is not None:
-                        # 用人脸框扩展为伪人体框（向下扩展3倍）
-                        fx1, fy1, fx2, fy2 = target_face.bbox
-                        face_h = fy2 - fy1
-                        face_w = fx2 - fx1
-                        print(f"[DEBUG] 仅人脸模式: face_bbox={target_face.bbox.astype(int).tolist()}")
-                        # 人脸大约是人体的1/7，向下扩展
+                    for face in faces:
+                        fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+                        face_w, face_h = fx2 - fx1, fy2 - fy1
+                        face_size = min(face_w, face_h)
+                        face_conf = face.confidence
+                        
+                        # 高置信度(>=0.80)可接受更小尺寸(30px)
+                        size_ok = face_size >= MIN_FACE_SIZE_FOR_START
+                        size_ok_relaxed = (face_conf >= HIGH_CONF_FOR_RELAXED_SIZE and 
+                                           face_size >= MIN_FACE_SIZE_FOR_START_RELAXED)
+                        
+                        if face_conf >= MIN_FACE_CONF_FOR_START and (size_ok or size_ok_relaxed):
+                            score = face_conf + face_size / 200.0
+                            if score > best_face_score:
+                                best_face_score = score
+                                best_face = face
+                    
+                    if best_face is not None:
+                        fx1, fy1, fx2, fy2 = best_face.bbox.astype(int)
+                        face_w, face_h = fx2 - fx1, fy2 - fy1
+                        face_size = min(face_w, face_h)
+                        print(f"[DEBUG] 仅人脸模式: bbox={best_face.bbox.astype(int).tolist()}, conf={best_face.confidence:.2f}, size={face_size}px")
+                        
+                        # 用人脸框扩展为伪人体框
                         pseudo_bbox = np.array([
                             max(0, fx1 - face_w * 0.5),
                             fy1,
                             min(w, fx2 + face_w * 0.5),
                             min(h, fy2 + face_h * 5)
                         ])
-                        print(f"[DEBUG] 伪人体框: pseudo_bbox={pseudo_bbox.astype(int).tolist()}")
+                        print(f"[DEBUG] 伪人体框: {pseudo_bbox.astype(int).tolist()}")
                         
+                        # 提取人脸特征
                         view = ViewFeature(timestamp=time.time())
                         view.has_face = True
                         face_feature = face_recognizer.extract_feature(
-                            frame, target_face.bbox, target_face.keypoints
+                            frame, best_face.bbox, best_face.keypoints
                         )
-                        if face_feature:
+                        if face_feature and face_feature.embedding is not None:
                             view.face_embedding = face_feature.embedding
-                            print(f"[DEBUG] 人脸特征提取成功: embedding_shape={face_feature.embedding.shape}, norm={np.linalg.norm(face_feature.embedding):.3f}")
+                            print(f"[DEBUG] 人脸特征: shape={face_feature.embedding.shape}, norm={np.linalg.norm(face_feature.embedding):.3f}")
+                            
+                            mv_recognizer.set_target(view, pseudo_bbox)
+                            mv_recognizer.clear_match_history()
+                            lost_frames = 0
+                            target_locked = True
+                            print(f"[手势启动] 目标已锁定 (仅人脸模式，等待人体补充)")
                         else:
-                            print(f"[DEBUG] 人脸特征提取失败!")
-                        
-                        mv_recognizer.set_target(view, pseudo_bbox)
-                        mv_recognizer.clear_match_history()  # 新目标，清空历史
-                        print(f"[DEBUG] 目标已设置: has_face_view={mv_recognizer.target.has_face_view if mv_recognizer.target else False}")
-                        lost_frames = 0
-                        print(f"[手势启动] 目标已锁定 (仅人脸，等待人体补充)")
+                            state_machine.state = SystemState.IDLE
+                            print("[提示] 人脸特征提取失败，请重试")
+                    else:
+                        state_machine.state = SystemState.IDLE
+                        print(f"[提示] 人脸质量不足 (需要conf>={MIN_FACE_CONF_FOR_START}+size>={MIN_FACE_SIZE_FOR_START}px, 或conf>={HIGH_CONF_FOR_RELAXED_SIZE}+size>={MIN_FACE_SIZE_FOR_START_RELAXED}px)")
+                
+                # ========== 场景3: 无检测 ==========
                 else:
-                    # 既没有人体也没有人脸
                     state_machine.state = SystemState.IDLE
-                    print("[提示] 未检测到人体或人脸，无法启动")
+                    print("[提示] 未检测到人脸，无法启动")
             
             elif state_machine.state == SystemState.IDLE and old_state == SystemState.TRACKING:
                 # 停止跟随 - 只有从 TRACKING 状态才能停止
@@ -621,6 +767,45 @@ def main():
         
         is_multi_person_scene = not is_single_person_scene
         
+        # ============================================
+        # 交汇检测：两人框重叠时需要特殊处理
+        # ============================================
+        # 场景：两人交叉走过，非目标站到前面，遮挡目标
+        # 风险：如果人脸太小无法验证，可能误跟踪到非目标
+        # 策略：检测到交汇时，提高匹配阈值，宁可丢失也不误跟踪
+        is_crossing_scene = False
+        crossing_iou = 0.0
+        
+        if num_persons >= 2:
+            # 计算所有人体框之间的最大IoU
+            for i in range(num_persons):
+                for j in range(i + 1, num_persons):
+                    box1 = persons[i].bbox.astype(int)
+                    box2 = persons[j].bbox.astype(int)
+                    
+                    # 计算IoU
+                    x1 = max(box1[0], box2[0])
+                    y1 = max(box1[1], box2[1])
+                    x2 = min(box1[2], box2[2])
+                    y2 = min(box1[3], box2[3])
+                    
+                    if x1 < x2 and y1 < y2:
+                        inter_area = (x2 - x1) * (y2 - y1)
+                        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+                        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+                        union_area = area1 + area2 - inter_area
+                        iou = inter_area / union_area if union_area > 0 else 0
+                        
+                        if iou > crossing_iou:
+                            crossing_iou = iou
+            
+            # IoU > 0.15 认为是交汇场景
+            CROSSING_IOU_THRESHOLD = 0.15
+            is_crossing_scene = crossing_iou > CROSSING_IOU_THRESHOLD
+            
+            if is_crossing_scene and frame_count % 30 == 0:
+                print(f"[DEBUG] ⚠️ 检测到交汇场景 (IoU={crossing_iou:.2f}), 启用严格匹配模式")
+        
         if state_machine.state == SystemState.TRACKING:
             matched_any = False
             
@@ -640,6 +825,10 @@ def main():
             # 1. 通过人体匹配 - 使用"最佳匹配"策略（而不是"第一个匹配"）
             # 收集所有候选匹配，选择最高分的
             all_person_matches = []  # [(idx, similarity, method, view, face_in_person, face_verified, face_sim, body_sim)]
+            
+            # 记录人体被拒绝的原因，用于决定是否允许仅人脸匹配
+            persons_rejected_by_face_mismatch = 0  # 因"人脸明确不匹配"被拒绝的人体数
+            persons_total_checked = 0
             
             # 关键保护：如果目标有人脸特征，候选人也有人脸时必须通过人脸验证
             target_has_face = mv_recognizer.target and mv_recognizer.target.has_face_view
@@ -733,20 +922,36 @@ def main():
                     face_in_person = view.has_face and view.face_embedding is not None
                     
                     # ============================================
-                    # 简化的匹配逻辑（防止误跟踪他人）
+                    # 分层匹配逻辑（基于人脸质量分级）
                     # ============================================
-                    # 核心思路:
-                    #   1. 人脸 > 阈值 且 尺寸够大 → 靠人脸判断
-                    #   2. 人脸 < 阈值 或 尺寸太小 → 靠 motion + body 判断
-                    #   3. motion + body 都低 → 目标丢失
+                    # 对于【有效人脸】(size>=50px, conf>=0.65):
+                    #   F >= 0.65: face_priority (高置信度，仅靠人脸)
+                    #   0.45 <= F < 0.65: face + motion (中等置信度)
+                    #   0.30 <= F < 0.45: body + motion (低置信度人脸)
+                    #   F < 0.30: 明确拒绝 (即使body+motion高也拒绝)
+                    # 
+                    # 对于【无效人脸】(小/低置信度/无人脸):
+                    #   只能靠 body + motion
                     # ============================================
                     
-                    FACE_MATCH_THRESHOLD = 0.55  # 人脸匹配阈值
-                    BODY_MOTION_THRESHOLD = 0.65  # body + motion 综合阈值
+                    # 人脸相似度分层阈值
+                    FACE_HIGH_THRESHOLD = 0.65      # 高置信度：仅靠人脸
+                    FACE_MEDIUM_THRESHOLD = 0.45    # 中等置信度：人脸+motion
+                    FACE_LOW_THRESHOLD = 0.30       # 低置信度临界值
+                    FACE_REJECT_THRESHOLD = 0.30    # 低于此值明确拒绝
+                    
+                    FACE_MATCH_THRESHOLD = 0.55     # 人脸匹配阈值（兼容旧逻辑）
+                    BODY_MOTION_THRESHOLD = 0.65    # body + motion 综合阈值
                     MULTI_PERSON_BODY_THRESHOLD = 0.70  # 多人场景下仅body匹配的阈值
+                    
+                    # 有效人脸的定义
+                    MIN_FACE_SIZE_FOR_VALID = 30    # 有效人脸最小尺寸（测试验证30px即可准确识别）
+                    MIN_FACE_CONF_FOR_VALID = 0.65  # 有效人脸最低置信度
+                    MIN_FACE_SIZE_RELAXED = 30      # 放宽条件的最小尺寸
                     
                     # 检查人脸尺寸是否足够大
                     face_size_valid = False
+                    face_size_valid_relaxed = False  # 放宽条件（单人+高相似度）
                     current_face_size = 0
                     for face in faces:
                         fx1, fy1, fx2, fy2 = face.bbox.astype(int)
@@ -757,6 +962,7 @@ def main():
                             face_h = fy2 - fy1
                             current_face_size = min(face_w, face_h)
                             face_size_valid = current_face_size >= MIN_FACE_SIZE
+                            face_size_valid_relaxed = current_face_size >= MIN_FACE_SIZE_RELAXED
                             break
                     
                     # 计算 body + motion 综合分数
@@ -768,57 +974,157 @@ def main():
                     body_weight = 1.0 - motion_weight
                     body_motion_score = body_sim * body_weight + motion_score * motion_weight
                     
-                    # 判断匹配类型 (人脸有效 = 相似度高 且 尺寸够大)
-                    face_matched = (face_sim is not None and 
-                                    face_sim >= FACE_MATCH_THRESHOLD and 
-                                    face_size_valid)
+                    # 判断匹配类型
+                    # 人脸有效条件：
+                    #   - 标准: 相似度>=0.55 且 尺寸>=40px
+                    #   - 放宽(单人+高置信): 相似度>=0.65 且 尺寸>=20px
+                    face_matched_standard = (face_sim is not None and 
+                                             face_sim >= FACE_MATCH_THRESHOLD and 
+                                             face_size_valid)
+                    face_matched_relaxed = (face_sim is not None and 
+                                            face_sim >= FACE_HIGH_THRESHOLD and  # 修复：使用正确的常量名
+                                            face_size_valid_relaxed and 
+                                            is_single_person_scene)
+                    face_matched = face_matched_standard or face_matched_relaxed
                     body_motion_matched = body_motion_score >= BODY_MOTION_THRESHOLD
                     
                     if frame_count % 30 == 0 and face_sim is not None:
-                        print(f"[DEBUG] Person[{idx}] face_size={current_face_size}px, valid={face_size_valid}, face_matched={face_matched}")
+                        # 只有当通过放宽条件而非标准条件时才显示 relaxed
+                        relaxed_info = ""
+                        if face_matched_relaxed and not face_matched_standard:
+                            relaxed_info = ", relaxed=True"
+                        print(f"[DEBUG] Person[{idx}] face_size={current_face_size}px, valid={face_size_valid}, face_matched={face_matched}{relaxed_info}")
                     
                     # 决策逻辑
                     accept = False
                     match_type = ""
+                    persons_total_checked += 1
                     
-                    if face_matched:
-                        # Case 1: 人脸匹配 → 直接信任
+                    # ============================================
+                    # 分层决策：基于人脸有效性和相似度
+                    # ============================================
+                    # 1. 先判断人脸是否"有效"（可用于判断身份）
+                    # 2. 有效人脸：根据相似度分层决策
+                    # 3. 无效人脸：只能靠 body + motion
+                    # ============================================
+                    
+                    # 获取人脸置信度（用于判断有效性）
+                    current_face_conf = 0.0
+                    for face in faces:
+                        fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+                        fc_x, fc_y = (fx1 + fx2) // 2, (fy1 + fy2) // 2
+                        px1, py1, px2, py2 = person.bbox.astype(int)
+                        if px1 <= fc_x <= px2 and py1 <= fc_y <= py2:
+                            current_face_conf = face.confidence
+                            break
+                    
+                    # 判断人脸是否"有效"（可用于身份判断）
+                    face_is_valid = (face_in_person and 
+                                    face_sim is not None and 
+                                    current_face_size >= MIN_FACE_SIZE_FOR_VALID and
+                                    current_face_conf >= MIN_FACE_CONF_FOR_VALID)
+                    
+                    # 放宽的有效条件（高相似度时可接受较小人脸）
+                    face_is_valid_relaxed = (face_in_person and 
+                                            face_sim is not None and 
+                                            current_face_size >= MIN_FACE_SIZE_RELAXED and
+                                            current_face_conf >= 0.60)
+                    
+                    if frame_count % 30 == 0:
+                        face_str = f"F:{face_sim:.2f}" if face_sim is not None else "F:None"
+                        print(f"[DEBUG] Person[{idx}] 人脸有效性: size={current_face_size}px, conf={current_face_conf:.2f}, valid={face_is_valid}, relaxed_valid={face_is_valid_relaxed}")
+                    
+                    if face_is_valid:
+                        # ========== 有效人脸：基于相似度分层 ==========
+                        if face_sim >= FACE_HIGH_THRESHOLD:
+                            # Layer 1: F >= 0.65 → 高置信度，仅靠人脸
+                            accept = True
+                            match_type = "face"
+                            if frame_count % 30 == 0:
+                                print(f"[DEBUG] Person[{idx}] ✓ 有效人脸高置信度 (F:{face_sim:.2f}>=0.65) → face_priority")
+                        elif face_sim >= FACE_MEDIUM_THRESHOLD:
+                            # Layer 2: 0.45 <= F < 0.65 → 中等置信度，需要motion辅助
+                            # 要求 motion >= 0.5 或 综合分数够高
+                            if motion_score >= 0.5 or body_motion_score >= BODY_MOTION_THRESHOLD:
+                                accept = True
+                                match_type = "face_motion"
+                                if frame_count % 30 == 0:
+                                    print(f"[DEBUG] Person[{idx}] ✓ 有效人脸中等置信度 (F:{face_sim:.2f}, M:{motion_score:.2f}) → face+motion")
+                            else:
+                                accept = False
+                                if frame_count % 30 == 0:
+                                    print(f"[DEBUG] Person[{idx}] ✗ 有效人脸中等但motion不足 (F:{face_sim:.2f}, M:{motion_score:.2f}<0.5)")
+                        elif face_sim >= FACE_LOW_THRESHOLD:
+                            # Layer 3: 0.30 <= F < 0.45 → 低置信度，需要body+motion
+                            if body_motion_score >= BODY_MOTION_THRESHOLD:
+                                accept = True
+                                match_type = "body_motion"
+                                if frame_count % 30 == 0:
+                                    print(f"[DEBUG] Person[{idx}] ✓ 有效人脸低置信度 (F:{face_sim:.2f}) + body+motion高 → body+motion")
+                            else:
+                                accept = False
+                                if frame_count % 30 == 0:
+                                    print(f"[DEBUG] Person[{idx}] ✗ 有效人脸低置信度 (F:{face_sim:.2f}) 且body+motion不足")
+                        else:
+                            # Layer 4: F < 0.30 → 明确不匹配，拒绝！
+                            # ★★★ 核心修复：即使body+motion高也拒绝 ★★★
+                            accept = False
+                            persons_rejected_by_face_mismatch += 1
+                            if frame_count % 30 == 0:
+                                scene_type = "多人" if is_multi_person_scene else "单人"
+                                print(f"[DEBUG] Person[{idx}] ✗✗ {scene_type}有效人脸明确不匹配 (F:{face_sim:.2f}<0.30) → 直接拒绝")
+                    
+                    elif face_is_valid_relaxed and face_sim is not None and face_sim >= FACE_HIGH_THRESHOLD:
+                        # ========== 放宽条件：较小人脸但高相似度 ==========
                         accept = True
                         match_type = "face"
                         if frame_count % 30 == 0:
-                            print(f"[DEBUG] Person[{idx}] 人脸匹配通过 (F:{face_sim:.2f}>={FACE_MATCH_THRESHOLD})")
-                    elif target_has_face and face_in_person and face_sim is not None and face_sim < 0.30:
-                        # Case 2: 目标有脸 + 候选有脸 + 人脸明确不匹配 → 多人场景拒绝，单人场景看body+motion
-                        if is_multi_person_scene:
-                            if frame_count % 30 == 0:
-                                print(f"[DEBUG] Person[{idx}] 多人场景人脸明确不匹配(F:{face_sim:.2f}<0.30), 拒绝")
-                            accept = False
-                        elif body_motion_matched:
-                            accept = True
-                            match_type = "body_motion"
-                            if frame_count % 30 == 0:
-                                print(f"[DEBUG] Person[{idx}] 单人场景人脸低(F:{face_sim:.2f})但body+motion高({body_motion_score:.2f}), 通过")
-                        else:
-                            if frame_count % 30 == 0:
-                                print(f"[DEBUG] Person[{idx}] 单人场景人脸低且body+motion不足({body_motion_score:.2f}<{BODY_MOTION_THRESHOLD}), 拒绝")
-                            accept = False
+                            print(f"[DEBUG] Person[{idx}] ✓ 放宽有效人脸高置信度 (F:{face_sim:.2f}>=0.65, size={current_face_size}px)")
+                    
+                    elif face_is_valid_relaxed and face_sim is not None and face_sim < FACE_REJECT_THRESHOLD:
+                        # ========== 放宽条件：较小人脸但明确不匹配 ==========
+                        accept = False
+                        persons_rejected_by_face_mismatch += 1
+                        if frame_count % 30 == 0:
+                            scene_type = "多人" if is_multi_person_scene else "单人"
+                            print(f"[DEBUG] Person[{idx}] ✗✗ {scene_type}较小人脸明确不匹配 (F:{face_sim:.2f}<0.30, size={current_face_size}px) → 拒绝")
+                    
                     elif body_motion_matched:
-                        # Case 3: 人脸不够但 body+motion 够 → 通过
-                        # 多人场景需要更高的 body 阈值
-                        if is_multi_person_scene and target_has_face and body_sim < MULTI_PERSON_BODY_THRESHOLD:
+                        # ========== 无有效人脸：靠 body + motion ==========
+                        
+                        # ★★★ 重要：小人脸（<30px）的F值不可靠，不能用于拒绝决策！★★★
+                        # 只有"放宽有效"的人脸（>=30px）才能用F<0.30来判断不匹配
+                        # 小人脸的低F值可能是特征提取不准，而不是真的不匹配
+                        
+                        if face_is_valid_relaxed and face_sim is not None and face_sim < FACE_REJECT_THRESHOLD:
+                            # 放宽有效的人脸（>=30px），F<0.30 → 明确不匹配
+                            accept = False
+                            persons_rejected_by_face_mismatch += 1
                             if frame_count % 30 == 0:
-                                print(f"[DEBUG] Person[{idx}] 多人场景无人脸验证且body不足({body_sim:.2f}<{MULTI_PERSON_BODY_THRESHOLD}), 拒绝")
+                                scene_type = "多人" if is_multi_person_scene else "单人"
+                                print(f"[DEBUG] Person[{idx}] ✗✗ {scene_type}人脸明确不匹配 (F:{face_sim:.2f}<0.30, size={current_face_size}px>=30) → 拒绝")
+                        # 交汇场景特殊处理
+                        elif is_crossing_scene and target_has_face:
+                            # 交汇时没有有效人脸验证 → 宁可短暂丢失
+                            if frame_count % 30 == 0:
+                                face_str = f"F:{face_sim:.2f}" if face_sim is not None else "F:None"
+                                print(f"[DEBUG] Person[{idx}] ⚠️ 交汇场景无有效人脸({face_str}, size={current_face_size}px), 暂停匹配")
+                            accept = False
+                        # 多人场景：body阈值提高
+                        elif is_multi_person_scene and target_has_face and body_sim < MULTI_PERSON_BODY_THRESHOLD - 0.01:
+                            if frame_count % 30 == 0:
+                                print(f"[DEBUG] Person[{idx}] ✗ 多人场景无有效人脸且body不足({body_sim:.2f}<{MULTI_PERSON_BODY_THRESHOLD-0.01:.2f})")
                             accept = False
                         else:
                             accept = True
                             match_type = "body_motion"
                             if frame_count % 30 == 0:
-                                print(f"[DEBUG] Person[{idx}] body+motion匹配通过 (B:{body_sim:.2f}+M:{motion_score:.2f}={body_motion_score:.2f})")
+                                print(f"[DEBUG] Person[{idx}] ✓ 无有效人脸，body+motion通过 (B:{body_sim:.2f}+M:{motion_score:.2f}={body_motion_score:.2f})")
                     else:
-                        # Case 4: 人脸和body+motion都不够 → 拒绝
+                        # ========== 什么都不够 ==========
                         if frame_count % 30 == 0:
                             face_str = f"F:{face_sim:.2f}" if face_sim is not None else "F:None"
-                            print(f"[DEBUG] Person[{idx}] 人脸和body+motion都不足 ({face_str}, BM:{body_motion_score:.2f}), 拒绝")
+                            print(f"[DEBUG] Person[{idx}] ✗ 无有效人脸且body+motion不足 ({face_str}, BM:{body_motion_score:.2f})")
                         accept = False
                     
                     if accept:
@@ -828,12 +1134,12 @@ def main():
             # 选择最佳匹配
             if all_person_matches:
                 # 策略: 
-                #   1. 优先选人脸匹配的（身份最可靠）
+                #   1. 优先选人脸匹配的（身份最可靠）：face, face_motion
                 #   2. 人脸匹配中优先选 motion 高的（轨迹最一致）
                 #   3. 其次选 body+motion 匹配的
                 #   4. body+motion 中多人场景优先选 motion 高的
                 # tuple: (idx, similarity, method, view, face_in_person, face_matched, face_sim, body_sim, motion_score, match_type)
-                matches_by_face = [m for m in all_person_matches if m[9] == "face"]  # m[9] = match_type
+                matches_by_face = [m for m in all_person_matches if m[9] in ("face", "face_motion")]  # m[9] = match_type
                 matches_by_body_motion = [m for m in all_person_matches if m[9] == "body_motion"]
                 
                 best_match = None
@@ -861,6 +1167,14 @@ def main():
                     target_person_idx = idx
                     lost_frames = 0
                     
+                    # ★★★ 关键日志：标注最终选择的目标 ★★★
+                    if frame_count % 30 == 0:
+                        px1, py1, px2, py2 = persons[idx].bbox.astype(int)
+                        face_str = f"F:{match_face_sim:.2f}" if match_face_sim is not None else "F:None"
+                        print(f"[★目标★] Person[{idx}] 被选为目标 (绿框)")
+                        print(f"         bbox=[{px1},{py1},{px2},{py2}], {face_str}, B:{match_body_sim:.2f}, M:{match_motion_score:.2f}")
+                        print(f"         匹配类型: {match_type}, 方法: {method[:50]}")
+                    
                     # 保存当前匹配信息用于显示
                     current_match_info = {
                         'type': 'person',
@@ -880,27 +1194,55 @@ def main():
                     #   1. 人脸匹配 + body不匹配但motion+body高 → 学习body（前提：人脸在人体框内）
                     #   2. motion+body匹配 + 人脸低但>某值 → 学习人脸（前提：人脸在人体框内）
                     #   3. 关键约束：有人脸+有人体时，学习必须保证人脸在人体框内
+                    #   4. 视角库满时：用替换策略而非停止学习
                     # ============================================
                     
                     should_learn = False
                     learn_what = ""  # "body" or "face" or "both"
                     learn_reason = ""
+                    use_replace_strategy = False  # 是否使用替换策略
                     
                     target_has_body = (mv_recognizer.target is not None and 
                                        any(v.has_body for v in mv_recognizer.target.view_features))
                     
-                    # 容量检查：视角库已满时停止学习
+                    # 容量检查：视角库满时改用替换策略
                     current_view_count = mv_recognizer.target.num_views if mv_recognizer.target else 0
                     if current_view_count >= MAX_VIEW_COUNT:
+                        # 不停止学习，而是检查是否值得替换
+                        use_replace_strategy = True
                         if frame_count % 60 == 0:
-                            print(f"[DEBUG] 视角库已满({current_view_count}>={MAX_VIEW_COUNT})，停止学习")
-                        should_learn = False
+                            print(f"[DEBUG] 视角库已满({current_view_count})，启用替换策略")
+                    
                     # 多人场景 + 没有人脸匹配 = 禁止学习
-                    elif is_multi_person_scene and match_type != "face":
+                    # 多人场景 + 人脸-人体不一致 = 禁止学习（防止关联错误导致学习污染）
+                    if is_multi_person_scene and match_type != "face":
                         if frame_count % 30 == 0:
                             print(f"[DEBUG] 多人场景无人脸匹配，禁止学习")
                         should_learn = False
-                    else:
+                    elif is_multi_person_scene and match_type == "face":
+                        # 多人场景下人脸匹配：检查人脸-人体一致性
+                        # 如果人脸高匹配(F>=0.55)但身体低匹配(B<0.60)，可能是关联错误
+                        match_face_sim_check = best_match[6] if best_match[6] is not None else 0.0
+                        match_body_sim_check = best_match[7]
+                        
+                        # 计算差距：人脸相似度 - 身体相似度
+                        face_body_gap = match_face_sim_check - match_body_sim_check
+                        
+                        # 如果差距过大（>=0.25），或者身体相似度太低（<0.55），禁止学习
+                        FACE_BODY_CONSISTENCY_GAP = 0.25  # 允许的最大差距
+                        BODY_MIN_FOR_LEARN_MULTI = 0.55   # 多人场景下学习需要的最低body相似度
+                        
+                        if match_body_sim_check < BODY_MIN_FOR_LEARN_MULTI:
+                            if frame_count % 30 == 0:
+                                print(f"[DEBUG] 多人场景人脸-人体不一致(F:{match_face_sim_check:.2f}, B:{match_body_sim_check:.2f}<{BODY_MIN_FOR_LEARN_MULTI})，禁止学习")
+                            should_learn = False
+                        elif face_body_gap > FACE_BODY_CONSISTENCY_GAP:
+                            if frame_count % 30 == 0:
+                                print(f"[DEBUG] 多人场景人脸-人体差距过大(F:{match_face_sim_check:.2f}-B:{match_body_sim_check:.2f}={face_body_gap:.2f}>{FACE_BODY_CONSISTENCY_GAP})，禁止学习")
+                            should_learn = False
+                    
+                    # 只有未被禁止学习时才继续学习逻辑
+                    if should_learn is not False or (not is_multi_person_scene):
                         # 提取匹配信息
                         match_face_sim = best_match[6] if best_match[6] is not None else 0.0
                         match_body_sim = best_match[7]
@@ -928,8 +1270,31 @@ def main():
                         
                         # Case 1: 人脸匹配通过 → 可以学习body
                         if match_type == "face":
-                            # 人脸匹配 + body+motion高 → 学习body（如果目标还没有body或需要更新）
-                            if body_motion_combined >= BODY_MOTION_LEARN_THRESHOLD:
+                            # 检查目标是否还没有人体视角（仅人脸模式启动的情况）
+                            target_has_body_view = mv_recognizer.target is not None and any(v.has_body for v in mv_recognizer.target.view_features)
+                            
+                            # Case 1a: 目标没有人体视角（仅人脸模式启动）+ 人脸匹配成功 + body+motion高 → 升级初始视角
+                            if not target_has_body_view and face_in_person and body_motion_combined >= 0.70:
+                                initial_view = mv_recognizer.target.view_features[0] if mv_recognizer.target.view_features else None
+                                if initial_view and initial_view.has_face and not initial_view.has_body:
+                                    # 升级初始视角：把人体特征加到初始视角上
+                                    # 合并：保留初始的人脸特征 + 新的人体特征
+                                    if view.part_color_hists is not None:
+                                        initial_view.part_color_hists = view.part_color_hists
+                                        initial_view.timestamp = time.time()
+                                        print(f"[初始视角升级] 仅人脸→有人体(F:{match_face_sim:.2f}, BM:{body_motion_combined:.2f})")
+                                        should_learn = False  # 已经升级，不需要再学习
+                                    else:
+                                        should_learn = True
+                                        learn_what = "body"
+                                        learn_reason = f"首次学习人体(F:{match_face_sim:.2f}, BM:{body_motion_combined:.2f})"
+                                else:
+                                    should_learn = True
+                                    learn_what = "body"
+                                    learn_reason = f"人脸匹配(F:{match_face_sim:.2f})学习body(BM:{body_motion_combined:.2f})"
+                            
+                            # Case 1b: 目标已有人体视角 + 人脸匹配 + body+motion高 → 学习body
+                            elif target_has_body_view and body_motion_combined >= BODY_MOTION_LEARN_THRESHOLD:
                                 # 关键约束：人脸必须在人体框内！
                                 if face_in_person:
                                     should_learn = True
@@ -945,23 +1310,51 @@ def main():
                                 learn_reason = f"人脸高置信(F:{match_face_sim:.2f}, size={current_face_size_for_learn}px)"
                         
                         # Case 2: body+motion匹配通过 → 可以学习人脸
+                        # 注意：方案D确保启动时一定有人脸，所以不需要"首次学习人脸"逻辑
                         elif match_type == "body_motion":
-                            # body+motion匹配 + 有人脸且>某值 + 人脸尺寸够大 → 学习人脸
+                            # Case 2a: 人脸相似度够高 → 学习/更新人脸
                             if face_in_person and match_face_sim >= FACE_MIN_FOR_BODY_LEARN and face_size_ok_for_learn:
                                 # 关键约束：人脸必须在人体框内 且 尺寸足够大！
                                 should_learn = True
                                 learn_what = "face"
                                 learn_reason = f"body+motion匹配(BM:{body_motion_combined:.2f})学习face(F:{match_face_sim:.2f}, size={current_face_size_for_learn}px)"
+                            
+                            # Case 2b: 无人脸/背面/侧面 → 学习body视角
                             elif not face_in_person and body_motion_combined >= BODY_MOTION_LEARN_THRESHOLD:
                                 # 纯背面/侧面，学习body视角
+                                # 注意：这里 face_in_person=False 可能是：
+                                #   1. 真正的背面（没有人脸检测）
+                                #   2. 人脸检测漏检（瞬时）
+                                #   3. 人脸不在人体框内（检测偏移）
                                 should_learn = True
                                 learn_what = "body"
-                                learn_reason = f"背面匹配(BM:{body_motion_combined:.2f})"
+                                reason_detail = "背面/无脸" if len(faces) == 0 else "脸不在框内"
+                                learn_reason = f"{reason_detail}匹配(BM:{body_motion_combined:.2f})"
                     
+                    # 执行学习（普通或替换模式）
                     if should_learn:
-                        learned, op_info = mv_recognizer.auto_learn(view, persons[idx].bbox, True)
-                        if learned:
-                            print(f"[自动学习] {learn_reason} -> {op_info}")
+                        if use_replace_strategy:
+                            # 替换策略：找到最差/最老的视角替换
+                            # 评估当前视角质量
+                            current_quality = 0.0
+                            if learn_what == "face" and match_face_sim >= FACE_LEARN_THRESHOLD_LOCAL:
+                                current_quality = match_face_sim
+                            elif learn_what == "body" and body_motion_combined >= BODY_MOTION_LEARN_THRESHOLD:
+                                current_quality = body_motion_combined
+                            
+                            # 只有当前视角质量够高才考虑替换
+                            if current_quality >= 0.75:  # 替换门槛要高
+                                learned, op_info = mv_recognizer.auto_learn(view, persons[idx].bbox, True, replace_mode=True)
+                                if learned:
+                                    print(f"[替换学习] {learn_reason} (quality={current_quality:.2f}) -> {op_info}")
+                            else:
+                                if frame_count % 60 == 0:
+                                    print(f"[DEBUG] 当前质量({current_quality:.2f})<0.75，不替换")
+                        else:
+                            # 普通学习模式
+                            learned, op_info = mv_recognizer.auto_learn(view, persons[idx].bbox, True)
+                            if learned:
+                                print(f"[自动学习 F{frame_count}] {learn_reason} -> {op_info}")
             
             # 2. 如果人体没匹配到，尝试仅通过人脸匹配
             # ============================================
@@ -1000,11 +1393,19 @@ def main():
                                 face_in_any_person = True
                                 break
                     
-                    # 多人场景，人脸在不匹配的人体框内 → 跳过
-                    if num_persons > 1 and face_in_any_person:
+                    # 多人场景，人脸在不匹配的人体框内 → 通常跳过
+                    # 但例外：如果所有人体都是因为"人脸明确不匹配"被拒绝的，
+                    # 说明目标可能是另一个人脸（检测错位），应该继续尝试匹配
+                    all_rejected_by_face_mismatch = (persons_total_checked > 0 and 
+                                                     persons_rejected_by_face_mismatch == persons_total_checked)
+                    
+                    if num_persons > 1 and face_in_any_person and not all_rejected_by_face_mismatch:
                         if frame_count % 30 == 0:
                             print(f"[DEBUG] Face[{face_idx}] 在不匹配的人体框内(多人场景)，跳过")
                         continue
+                    elif num_persons > 1 and face_in_any_person and all_rejected_by_face_mismatch:
+                        if frame_count % 30 == 0:
+                            print(f"[DEBUG] Face[{face_idx}] 所有人体因人脸不匹配被拒绝，尝试仅人脸匹配")
                     
                     # 远处人脸使用更高阈值
                     is_distant_face = num_persons > 0 and not face_in_any_person
@@ -1025,7 +1426,11 @@ def main():
                                 if face_quality == 'stable':
                                     current_threshold = FACE_ONLY_THRESHOLD + multi_face_penalty
                                     if is_distant_face:
-                                        current_threshold += 0.10
+                                        # 高相似度(>=0.75)减少distant惩罚
+                                        if sim >= 0.75:
+                                            current_threshold += 0.05  # 减半惩罚
+                                        else:
+                                            current_threshold += 0.10
                                 elif face_quality == 'unstable':
                                     # 不稳定人脸: 使用更低阈值，但需要motion辅助验证
                                     current_threshold = FACE_ONLY_THRESHOLD_UNSTABLE + multi_face_penalty
@@ -1111,7 +1516,7 @@ def main():
                             face_only_view.face_embedding = face_feature.embedding
                             learned, op_info = mv_recognizer.auto_learn(face_only_view, faces[best_face_idx].bbox, True)
                             if learned:
-                                print(f"[自动学习] 仅人脸(sim={best_face_sim:.2f}) -> {op_info}")
+                                print(f"[自动学习 F{frame_count}] 仅人脸(sim={best_face_sim:.2f}) -> {op_info}")
                     elif frame_count % 30 == 0 and best_face_sim >= 0.60:
                         if best_face_quality == 'unstable':
                             print(f"[DEBUG] 不稳定人脸不学习")
@@ -1128,7 +1533,7 @@ def main():
                 # 清空匹配历史，防止误匹配
                 mv_recognizer.clear_match_history()
                 if frame_count % 30 == 0:
-                    print(f"[DEBUG] 未匹配, lost_frames={lost_frames}/{max_lost_frames}")
+                    print(f"[DEBUG F{frame_count}] 未匹配, lost_frames={lost_frames}/{max_lost_frames}")
                 if lost_frames >= max_lost_frames:
                     state_machine.state = SystemState.LOST_TARGET
                     print("[目标丢失] 等待重新出现或手势停止")
@@ -1230,6 +1635,14 @@ def main():
             #         ...
         
         # ============== 绘制 ==============
+        # ★★★ 绘制前日志：明确 target_person_idx 的值 ★★★
+        if frame_count % 30 == 0:
+            print(f"\n[绘制] target_person_idx={target_person_idx}, state={state_machine.state.value}")
+            for idx, person in enumerate(persons):
+                px1, py1, px2, py2 = person.bbox.astype(int)
+                is_target = (idx == target_person_idx)
+                print(f"       Person[{idx}]: bbox=[{px1},{py1},{px2},{py2}], 是目标={is_target}")
+        
         # 绘制人体框
         for idx, person in enumerate(persons):
             px1, py1, px2, py2 = person.bbox.astype(int)
@@ -1239,10 +1652,10 @@ def main():
                 label = "Candidate"
             elif idx == target_person_idx:
                 color = (0, 255, 0)  # 绿色
-                label = "TARGET"
+                label = f"TARGET[{idx}]"  # 标注索引
             else:
                 color = (0, 0, 255)  # 红色
-                label = "Other"
+                label = f"Other[{idx}]"  # 标注索引
             
             cv2.rectangle(frame, (px1, py1), (px2, py2), color, 2)
             
@@ -1275,9 +1688,13 @@ def main():
                             # 人脸已经通过验证
                             is_target_face = True
                         # 否则是纯人体匹配，不能确定人脸是否属于目标
-                    # 如果只有一个人脸在人体框内，也可以认为是目标人脸
-                    elif len([f for f in faces if px1 <= (f.bbox[0]+f.bbox[2])//2 <= px2 and py1 <= (f.bbox[1]+f.bbox[3])//2 <= py2]) == 1:
-                        is_target_face = True
+                    # 注意：不再使用 "只有一个人脸在框内就认为是目标" 的逻辑
+                    # 因为在遮挡场景下，遮挡者的人脸可能正好在目标人体框内
+                    # 这会导致错误的绿框
+            
+            # 人脸框绘制日志
+            if frame_count % 30 == 0:
+                print(f"       Face[{face_idx}]: is_target_face={is_target_face}, target_face_idx={target_face_idx}")
             
             if face_idx == target_face_idx and target_person_idx < 0:
                 # 仅人脸匹配的目标
