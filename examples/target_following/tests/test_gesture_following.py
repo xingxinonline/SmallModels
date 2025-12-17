@@ -1058,10 +1058,11 @@ def main():
                     # 不稳定人脸: 需要motion辅助验证
                     # 获取motion分数（使用最近的位置预测）
                     motion_score = 0.0
-                    if mv_recognizer.last_bbox is not None and best_face_idx >= 0:
+                    last_bbox = mv_recognizer.target.last_bbox if mv_recognizer.target else None
+                    if last_bbox is not None and best_face_idx >= 0:
                         # 计算人脸框与预测位置的IOU
                         face_bbox = faces[best_face_idx].bbox
-                        pred_bbox = mv_recognizer.last_bbox
+                        pred_bbox = last_bbox
                         
                         # 简化: 用中心点距离代替IOU
                         fc_x = (face_bbox[0] + face_bbox[2]) / 2
