@@ -660,14 +660,16 @@ def main():
                     # Case 1: 目标有脸 + 候选有脸 + 人脸验证失败 → 可能是其他人
                     # Case 2: 目标有脸 + 候选无脸 → 可能是目标背面或其他人背面
                     # 
-                    # 新增：侧脸容忍机制
-                    # - 当运动连续性极高 (motion > 0.95) 时，允许较低的人脸相似度
-                    # - 这解决了用户转头/侧脸时被误拒绝的问题
+                    # 新增：极端侧脸容忍机制
+                    # - 当运动连续性极高 (motion > 0.95) + body匹配高 时，可能是用户转身
+                    # - 侧脸/profile的face embedding与正脸差异极大，可能只有0.01~0.30
+                    # - 这不代表是不同的人，而是同一个人的不同角度
                     
-                    FACE_REJECT_THRESHOLD = 0.40   # 低于此值明确拒绝
-                    FACE_UNCERTAIN_THRESHOLD = 0.60  # 人脸验证阈值（降低以容忍侧脸）
-                    HIGH_BODY_TRUST_THRESHOLD = 0.82  # body 高时信任
+                    FACE_REJECT_THRESHOLD = 0.40   # 低于此值需要额外验证
+                    FACE_UNCERTAIN_THRESHOLD = 0.60  # 人脸验证阈值
+                    HIGH_BODY_TRUST_THRESHOLD = 0.78  # body 高时信任（降低以容忍转身）
                     BACK_VIEW_BODY_THRESHOLD = 0.70  # 目标有脸但候选无脸时的body阈值
+                    EXTREME_PROFILE_BODY_THRESHOLD = 0.75  # 极端侧脸时的body阈值
                     
                     # 侧脸容忍：运动连续性极高时放宽人脸要求
                     high_motion_trust = motion_score >= MOTION_TRUST_THRESHOLD
@@ -675,18 +677,44 @@ def main():
                     # Case 1: 目标有脸 + 候选有脸 + 人脸验证失败
                     if target_has_face and face_in_person and not face_verified:
                         if face_sim is not None:
-                            # 侧脸容忍：运动连续性极高 + 人脸不是完全不匹配 → 信任运动
-                            if high_motion_trust and face_sim >= FACE_SIDE_VIEW_MIN and is_single_person_scene:
+                            # ====== 极端侧脸检测 ======
+                            # 当 face_sim 极低（<0.35）但 motion 和 body 都很高时
+                            # 这通常是用户转身导致的，不是不同的人
+                            is_extreme_profile = (
+                                face_sim < FACE_SIDE_VIEW_MIN and  # 人脸相似度极低
+                                high_motion_trust and  # 运动连续性极高
+                                body_sim >= EXTREME_PROFILE_BODY_THRESHOLD and  # body匹配度高
+                                is_single_person_scene  # 单人场景
+                            )
+                            
+                            if is_extreme_profile:
+                                # 极端侧脸情况：信任 motion + body 组合
+                                if frame_count % 30 == 0:
+                                    print(f"[DEBUG] Person[{idx}] 极端侧脸: F:{face_sim:.2f}, B:{body_sim:.2f}, M:{motion_score:.2f}, 信任motion+body")
+                                # 通过，继续处理
+                            # 普通侧脸容忍：运动连续性极高 + 人脸不是完全不匹配 → 信任运动
+                            elif high_motion_trust and face_sim >= FACE_SIDE_VIEW_MIN and is_single_person_scene:
                                 if frame_count % 30 == 0:
                                     print(f"[DEBUG] Person[{idx}] 侧脸容忍: F:{face_sim:.2f}>={FACE_SIDE_VIEW_MIN}, M:{motion_score:.2f}>={MOTION_TRUST_THRESHOLD}, 信任运动")
                                 # 通过，继续处理
                             elif face_sim < FACE_REJECT_THRESHOLD:
-                                # 人脸相似度太低，明确是另一个人
-                                if frame_count % 30 == 0:
-                                    print(f"[DEBUG] Person[{idx}] 人脸明确不匹配({face_sim:.2f}<{FACE_REJECT_THRESHOLD}), 拒绝")
-                                continue
+                                # 人脸相似度太低，且不满足极端侧脸条件
+                                # 多人场景：直接拒绝
+                                # 单人场景：如果body够高，仍然信任
+                                if is_multi_person_scene:
+                                    if frame_count % 30 == 0:
+                                        print(f"[DEBUG] Person[{idx}] 多人场景人脸不匹配({face_sim:.2f}<{FACE_REJECT_THRESHOLD}), 拒绝")
+                                    continue
+                                elif body_sim < HIGH_BODY_TRUST_THRESHOLD:
+                                    if frame_count % 30 == 0:
+                                        print(f"[DEBUG] Person[{idx}] 单人场景人脸不匹配({face_sim:.2f})且body不够({body_sim:.2f}<{HIGH_BODY_TRUST_THRESHOLD}), 拒绝")
+                                    continue
+                                else:
+                                    if frame_count % 30 == 0:
+                                        print(f"[DEBUG] Person[{idx}] 单人场景人脸低({face_sim:.2f})但body高({body_sim:.2f}), 信任body")
+                                    # 通过
                             elif face_sim < FACE_UNCERTAIN_THRESHOLD:
-                                # 人脸不确定，需要 body 非常高才能信任
+                                # 人脸不确定，需要 body 高才能信任
                                 if body_sim >= HIGH_BODY_TRUST_THRESHOLD:
                                     if frame_count % 30 == 0:
                                         print(f"[DEBUG] Person[{idx}] 人脸不确定({face_sim:.2f})但body高({body_sim:.2f}>={HIGH_BODY_TRUST_THRESHOLD}), 信任body")
