@@ -550,14 +550,38 @@ def main():
         current_match_info = None  # 当前帧匹配信息，用于界面显示
         
         # ============== 场景判断 ==============
-        # 关键：多人场景应该用 max(persons, faces) 判断，而不是仅看 persons
-        # 场景分类：
-        #   单人: persons<=1 且 faces<=1
-        #   多人: persons>1 或 faces>1 (只要有一方>1就是多人风险场景)
+        # 单人场景的严格定义:
+        #   1. 只有单脸（无人体）
+        #   2. 只有单人体（无脸）
+        #   3. 单脸 + 单人体，且脸在人体框内
+        # 多人场景:
+        #   1. 多个人体
+        #   2. 多个人脸
+        #   3. 单脸 + 单人体，但脸不在人体框内（两个不同的人）
         num_persons = len(persons)
         num_faces = len(faces)
-        is_multi_person_scene = num_persons > 1 or num_faces > 1
-        is_single_person_scene = not is_multi_person_scene
+        
+        # 检查单脸+单人体时，脸是否在人体框内
+        face_in_person_for_scene = False
+        if num_faces == 1 and num_persons == 1:
+            fx1, fy1, fx2, fy2 = faces[0].bbox.astype(int)
+            fc_x, fc_y = (fx1 + fx2) // 2, (fy1 + fy2) // 2
+            px1, py1, px2, py2 = persons[0].bbox.astype(int)
+            face_in_person_for_scene = (px1 <= fc_x <= px2 and py1 <= fc_y <= py2)
+        
+        # 判断是否为单人场景
+        if num_persons == 0 and num_faces == 0:
+            is_single_person_scene = True  # 没人
+        elif num_persons == 0 and num_faces == 1:
+            is_single_person_scene = True  # 只有单脸
+        elif num_persons == 1 and num_faces == 0:
+            is_single_person_scene = True  # 只有单人体
+        elif num_persons == 1 and num_faces == 1 and face_in_person_for_scene:
+            is_single_person_scene = True  # 单脸+单人体，脸在框内
+        else:
+            is_single_person_scene = False  # 其他都是多人场景
+        
+        is_multi_person_scene = not is_single_person_scene
         
         if state_machine.state == SystemState.TRACKING:
             matched_any = False
@@ -565,7 +589,10 @@ def main():
             # 调试: 显示目标信息和场景类型
             if frame_count % 30 == 0:
                 scene_type = "多人" if is_multi_person_scene else "单人"
-                print(f"[DEBUG] 场景: {scene_type} (persons={num_persons}, faces={num_faces})")
+                extra_info = ""
+                if num_persons == 1 and num_faces == 1:
+                    extra_info = f", 脸在框内={face_in_person_for_scene}"
+                print(f"[DEBUG] 场景: {scene_type} (persons={num_persons}, faces={num_faces}{extra_info})")
                 if mv_recognizer.target:
                     t = mv_recognizer.target
                     print(f"[DEBUG] Target: num_views={t.num_views}, has_face_view={t.has_face_view}")
