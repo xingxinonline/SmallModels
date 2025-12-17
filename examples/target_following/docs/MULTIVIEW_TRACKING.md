@@ -2,7 +2,7 @@
 
 ## Multi-View Target Following System
 
-**版本**: v2.0  
+**版本**: v2.1  
 **日期**: 2025-12-17  
 **适用硬件**: S300 Chip (NPU/DSP/MCU) / PC 预验证环境
 
@@ -18,13 +18,13 @@
 
 | 特性          | 描述                                    | 版本 |
 | ------------- | --------------------------------------- | ---- |
-| 多视角特征库  | 自动积累正面/侧面/背面特征，最多10个视角 | v1.0 |
+| 多视角特征库  | 自动积累正面/侧面/背面特征，最多6个视角 | v2.1 |
 | 运动一致性    | 速度/方向预测 + 步态周期特征            | v2.0 |
 | 人脸+人体融合 | 有人脸时融合识别，无人脸时纯人体特征    | v1.0 |
 | 时域平滑      | 多帧投票确认，避免单帧误判闪烁          | v1.0 |
 | 自动学习      | 跟踪过程中自动学习新角度                | v1.0 |
 | 光照归一化    | CLAHE + 灰度世界白平衡，适应光照变化    | v2.0 |
-| 场景感知状态机 | 6状态自动切换 (人脸/融合/人体/背对/搜索) | v2.0 |
+| 人脸质量状态机 | stable/unstable/lost三级状态 + motion辅助 | v2.1 |
 | 安全控制层    | PID + 加速度限制 + 二阶滤波             | v2.0 |
 
 ### 1.3 场景适配策略 (v2.0 更新)
@@ -70,7 +70,7 @@
 │                        ▼                                                    │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │              多视角目标识别器 + 运动状态                              │   │
-│  │  - 多视角特征库 (最多10个视角，保护背面) ⭐ v2.0                      │   │
+│  │  - 多视角特征库 (最多6个视角，保护背面) ⭐ v2.1                       │   │
 │  │  - 运动一致性: 速度/方向预测 + 步态周期 ⭐ v2.0                       │   │
 │  │  - 时域平滑 (5帧投票)                                                │   │
 │  │  - 自动学习模块                                                      │   │
@@ -158,7 +158,7 @@ sequenceDiagram
         PersonDet-->>FaceDet: 人体bbox列表
         FaceDet->>FaceDet: 检测人脸
         FaceDet-->>FaceRec: 人脸bbox+关键点
-        FaceRec->>FaceRec: 提取人脸embedding(128D)
+        FaceRec->>FaceRec: 提取人脸embedding(512D)
         FaceRec-->>ReID: 人脸特征
         ReID->>ReID: 提取6段颜色+LBP+几何
         ReID-->>Target: 创建ViewFeature
@@ -279,7 +279,83 @@ stateDiagram-v2
   4. 几何特征 (宽高比, 相对高度, 面积比)
 ```
 
-### 3.2 多视角匹配算法
+### 3.2 人脸质量状态机 ⭐ v2.1
+
+人脸质量分为三级状态，每种状态使用不同的匹配策略：
+
+```python
+# 人脸稳定状态阈值
+FACE_STABLE_CONF = 0.70      # 置信度 >= 0.70
+FACE_STABLE_SIZE = 64        # 尺寸 >= 64px
+FACE_STABLE_SIM = 0.60       # 相似度 >= 0.60
+
+# 人脸不稳定状态阈值（侧脸/模糊）
+FACE_UNSTABLE_CONF = 0.40    # 置信度 >= 0.40
+FACE_UNSTABLE_SIZE = 48      # 尺寸 >= 48px
+FACE_UNSTABLE_SIM = 0.30     # 相似度 >= 0.30
+
+# 大尺寸人脸特殊处理
+LARGE_FACE_SIZE = 100        # 大尺寸人脸 >= 100px
+LARGE_FACE_MIN_CONF = 0.50   # 大尺寸人脸最低置信度
+
+def evaluate_face_quality(face_conf, face_size, face_sim):
+    """
+    评估人脸质量，返回状态: 'stable', 'unstable', 'lost'
+    
+    关键改进：大尺寸人脸（>=100px）即使置信度较低也应视为stable
+    因为大尺寸人脸的embedding质量通常较好
+    """
+    # 大尺寸人脸可以弥补低置信度
+    if face_size >= LARGE_FACE_SIZE and face_conf >= LARGE_FACE_MIN_CONF:
+        if face_sim is None or face_sim >= FACE_UNSTABLE_SIM:
+            return 'stable'
+    
+    # 正常判断
+    if (face_conf >= FACE_STABLE_CONF and 
+        face_size >= FACE_STABLE_SIZE and 
+        face_sim >= FACE_STABLE_SIM):
+        return 'stable'
+    elif (face_conf >= FACE_UNSTABLE_CONF and 
+          face_size >= FACE_UNSTABLE_SIZE and
+          face_sim >= FACE_UNSTABLE_SIM):
+        return 'unstable'
+    else:
+        return 'lost'
+```
+
+**三种状态的匹配策略**:
+
+| 状态         | 条件                                                           | 匹配策略                           | 阈值 |
+| ------------ | -------------------------------------------------------------- | ---------------------------------- | ---- |
+| **stable**   | conf≥0.70 & size≥64px & sim≥0.60 **或** size≥100px & conf≥0.50 | 纯人脸匹配                         | 0.70 |
+| **unstable** | conf≥0.40 & size≥48px & sim≥0.30                               | 人脸+motion辅助 (综合=F×0.6+M×0.4) | 0.50 |
+| **lost**     | 低于unstable阈值                                               | 等待人体出现，无法匹配             | -    |
+
+### 3.3 核心匹配策略（四种Case）
+
+```python
+# 关键阈值
+FACE_MATCH_THRESHOLD = 0.55        # 人脸匹配阈值
+BODY_MOTION_THRESHOLD = 0.65       # body + motion 综合阈值
+MULTI_PERSON_BODY_THRESHOLD = 0.70 # 多人场景下仅body匹配的阈值
+MIN_FACE_SIZE = 40                 # 匹配用最小人脸尺寸
+
+# Motion权重根据场景调整
+MOTION_WEIGHT_MULTI_PERSON = 0.6   # 多人场景motion权重
+MOTION_WEIGHT_SINGLE_PERSON = 0.5  # 单人场景motion权重
+
+# body + motion 综合分数
+body_motion_score = body_sim * (1 - motion_weight) + motion_score * motion_weight
+```
+
+| Case | 条件                            | 结果                     | 说明           |
+| ---- | ------------------------------- | ------------------------ | -------------- |
+| 1    | 人脸匹配(≥0.55) + 尺寸≥40px     | ✅ 通过                   | 直接信任人脸   |
+| 2    | 目标有脸 + 候选有脸 + 人脸<0.30 | ❌ 多人拒绝 / 单人看body  | 人脸明确不匹配 |
+| 3    | 人脸不够 + body+motion≥0.65     | ✅ 通过 (多人需body≥0.70) | 侧脸/转身      |
+| 4    | 人脸和body+motion都不够         | ❌ 拒绝                   | 无法确认身份   |
+
+### 3.4 多视角匹配算法
 
 ```python
 def compute_similarity(candidate, target):
@@ -348,12 +424,33 @@ def temporal_smoothing(is_match, match_history):
     return is_match
 ```
 
-### 3.5 自动学习机制
+### 3.5 自动学习机制 ⭐ v2.1
 
 ```python
-def auto_learn(candidate, is_match, target):
+# 学习阈值配置
+FACE_LEARN_THRESHOLD_LOCAL = 0.72   # 人脸匹配学习阈值
+BODY_MOTION_LEARN_THRESHOLD = 0.70  # body+motion 学习阈值
+FACE_MIN_FOR_BODY_LEARN = 0.50      # 学习body时人脸的最低要求
+MIN_FACE_SIZE_FOR_LEARN = 50        # 学习用最小人脸尺寸
+```
+
+**学习条件表**:
+
+| 场景                     | 学什么   | 条件                                |
+| ------------------------ | -------- | ----------------------------------- |
+| 人脸匹配 + body+motion高 | body     | face_in_person + BM≥0.70            |
+| 人脸高置信               | face     | F≥0.72 + size≥50px                  |
+| body+motion匹配 + 有人脸 | face     | face_in_person + F≥0.50 + size≥50px |
+| 纯背面匹配               | body     | BM≥0.70                             |
+| **多人+无人脸匹配**      | **禁止** | 防止特征污染                        |
+
+**视角库替换策略** (库满时):
+
+```python
+def auto_learn(candidate, is_match, replace_mode=False):
     """
     跟踪成功时自动学习新视角
+    replace_mode: 视角库满时启用替换策略
     """
     if not is_match:
         return False
@@ -363,14 +460,35 @@ def auto_learn(candidate, is_match, target):
         return False
     
     # 检查是否为新角度 (与所有已有视角相似度 < 0.7)
+    is_different = True
     for existing_view in target.view_features:
         if compute_similarity(candidate, existing_view) > 0.7:
-            return False  # 太相似，不需要添加
+            is_different = False
+            break
     
-    # 添加新视角
-    target.view_features.append(candidate)
+    if is_different:
+        if len(target.view_features) < MAX_VIEWS:
+            # 未满，直接添加
+            target.view_features.append(candidate)
+        else:
+            # 已满，智能替换
+            replace_idx = find_view_to_replace(candidate)
+            if replace_idx is not None:
+                target.view_features[replace_idx] = candidate
+    elif replace_mode and len(target.view_features) >= MAX_VIEWS:
+        # 强制替换模式：刷新最老同类型视角
+        oldest_idx = find_oldest_similar_view(candidate)
+        if oldest_idx is not None and oldest_idx > 0:  # 不替换初始视角
+            target.view_features[oldest_idx] = candidate
+    
     return True
 ```
+
+**视角库保证**:
+- ✅ 相似度>0.7的不重复存
+- ✅ 至少保留2个无脸视角（MIN_BACK_VIEWS=2，侧身+背面）
+- ✅ 初始视角(索引0)永不替换
+- ❌ 不保证固定角度覆盖（取决于用户实际运动）
 
 ### 3.6 光照归一化预处理 ⭐ v2.0
 
@@ -567,7 +685,7 @@ class TargetController:
 
 | 模型          | 用途     | 大小  | 输入    | 输出      | 特征维度 |
 | ------------- | -------- | ----- | ------- | --------- | -------- |
-| MobileFaceNet | 人脸识别 | 4.0MB | 112×112 | embedding | 128D     |
+| MobileFaceNet | 人脸识别 | 13MB | 112×112 | embedding | 512D     |
 
 ### 4.3 手工特征
 
@@ -592,11 +710,11 @@ MultiViewConfig(
     
     # 阈值
     face_threshold = 0.45,      # 人脸匹配阈值
-    body_threshold = 0.45,      # 人体匹配阈值 (多视角可降低)
-    fused_threshold = 0.45,     # 融合匹配阈值
+    body_threshold = 0.50,      # 人体匹配阈值 (多视角可降低)
+    fused_threshold = 0.48,     # 融合匹配阈值
     
     # 运动一致性
-    motion_weight = 0.20,       # 运动一致性权重
+    motion_weight = 0.15,       # 运动一致性权重
     max_motion_distance = 150,  # 最大位移 (像素)
     motion_time_window = 0.5,   # 时间窗口 (秒)
     
@@ -607,9 +725,10 @@ MultiViewConfig(
     # 自动学习
     auto_learn = True,          # 是否开启
     learn_interval = 2.0,       # 学习间隔 (秒)
+    max_views = 6,              # 最大视角数 (有脸3-4 + 无脸2)
     
     # 分区权重 (降低头部)
-    part_weights = [0.05, 0.12, 0.20, 0.20, 0.25, 0.18]
+    part_weights = [0.05, 0.15, 0.20, 0.20, 0.25, 0.15]  # 头/肩/胸/腰/大腿/小腿
 )
 ```
 
@@ -884,7 +1003,7 @@ examples/target_following/
 
 ### 10.1 已完成 ✅
 
-- [x] 多视角特征库 (最多10个视角)
+- [x] 多视角特征库 (最多6个视角)
 - [x] 场景感知状态机 (6状态自动切换)
 - [x] 光照归一化预处理 (CLAHE + 灰度世界白平衡)
 - [x] 增强运动一致性 (步态周期估计)
@@ -1024,6 +1143,7 @@ examples/target_following/
 |------|------|----------|
 | v1.0 | 2025-12-16 | 初始版本：多视角特征库、运动一致性、自动学习 |
 | v2.0 | 2025-12-17 | 场景感知状态机、光照归一化、步态周期、安全控制层 |
+| v2.1 | 2025-12-17 | 人脸质量状态机(stable/unstable/lost)、四种匹配Case、视角库替换策略、参数修正 |
 
 ---
 
