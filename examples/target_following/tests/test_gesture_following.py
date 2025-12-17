@@ -47,49 +47,87 @@ from core.state_machine import StateMachine
 GESTURE_HOLD_DURATION = 3.0  # 触发需要保持的秒数
 GESTURE_COOLDOWN_SECONDS = 3.0  # 触发后冷却秒数 (防止连续触发)
 
-# 仅人脸匹配阈值
-# 问题：不同人之间也可能有 0.55-0.65 的相似度
-# 解决：提高阈值到 0.70，牺牲一些召回率换取精确率
-FACE_ONLY_THRESHOLD = 0.70
+# ============================================
+# 人脸质量状态定义（核心状态机）
+# ============================================
+# 人脸状态分为三级：稳定 / 不稳定 / 丢失
+# 不同状态使用不同的匹配策略
+
+# 人脸稳定状态阈值
+FACE_STABLE_CONF = 0.70      # 置信度 >= 0.70
+FACE_STABLE_SIZE = 64        # 尺寸 >= 64px
+FACE_STABLE_SIM = 0.60       # 相似度 >= 0.60
+FACE_STABLE_FRAMES = 3       # 连续帧 >= 3
+
+# 人脸不稳定状态阈值（侧脸/模糊）
+FACE_UNSTABLE_CONF = 0.40    # 置信度 >= 0.40
+FACE_UNSTABLE_SIZE = 48      # 尺寸 >= 48px
+FACE_UNSTABLE_SIM = 0.30     # 相似度 >= 0.30
+FACE_UNSTABLE_FRAMES = 2     # 连续帧 >= 2
+
+# 人脸丢失阈值
+FACE_LOST_CONF = 0.40        # 置信度 < 0.40
+FACE_LOST_SIZE = 48          # 尺寸 < 48px
+FACE_LOST_FRAMES = 3         # 连续丢失帧 >= 3
+
+# 仅人脸匹配阈值（无人体时的备用）
+FACE_ONLY_THRESHOLD = 0.70           # 稳定人脸
+FACE_ONLY_THRESHOLD_UNSTABLE = 0.50  # 不稳定人脸 + motion辅助
 
 # 自动学习阈值
-# - 多人场景：需要人脸验证 + 高阈值（防止学习错误人脸）
-# - 单人场景：可放宽
-# 关键修复：0.65 太低会在多人场景学习到他人人脸，导致目标切换
-FACE_LEARN_THRESHOLD = 0.72  # 人脸匹配学习阈值 (提高以防止学习错误人脸)
-FACE_LEARN_THRESHOLD_MULTI = 0.78  # 多人场景下的人脸学习阈值（更严格）
-BODY_LEARN_THRESHOLD = 0.68  # 人体匹配学习阈值（提高）
+FACE_LEARN_THRESHOLD = 0.72  # 人脸匹配学习阈值
+FACE_LEARN_THRESHOLD_MULTI = 0.78  # 多人场景下的人脸学习阈值
+BODY_LEARN_THRESHOLD = 0.68  # 人体匹配学习阈值
 
-# 重新锁定阈值 - 从丢失状态恢复需要更高信心
-RELOCK_FACE_THRESHOLD = 0.70  # 降低以便更容易重新锁定
+# 重新锁定阈值
+RELOCK_FACE_THRESHOLD = 0.70
+RELOCK_CONFIRM_FRAMES = 2
+AUTO_LEARN_CONFIRM_FRAMES = 1
 
-# 连续帧确认 - 防止瞬间误匹配导致的误锁定
-# 重新锁定需要连续N帧都匹配成功才确认
-RELOCK_CONFIRM_FRAMES = 2  # 连续帧数要求 (从3降到2)
-AUTO_LEARN_CONFIRM_FRAMES = 1  # 自动学习不需要连续帧（高置信度时直接学习）
+# 视角库最大容量
+MAX_VIEW_COUNT = 8
 
-# 视角库最大容量 - 防止特征库无限膨胀
-MAX_VIEW_COUNT = 8  # 最多保存8个视角
-
-# 人脸有效尺寸 - 小人脸embedding质量差，容易误识别
-MIN_FACE_SIZE = 40  # 人脸最小边长(像素)
-MIN_FACE_SIZE_FOR_LEARN = 50  # 学习时人脸最小边长(更严格)
+# 人脸有效尺寸（匹配用）
+MIN_FACE_SIZE = 40
+MIN_FACE_SIZE_FOR_LEARN = 50
 
 # ============================================
-# 多帧投票机制 - 避免单帧误判
+# 多帧投票机制
 # ============================================
-# 连续N帧未匹配才判定丢失，防止瞬时遮挡误判
-LOST_CONFIRM_FRAMES = 5  # 连续未匹配帧数才丢失 (默认 max_lost_frames=30)
-# 匹配结果缓冲 - 保存最近N帧的匹配情况用于投票
-MATCH_HISTORY_SIZE = 5  # 保存最近5帧匹配历史
-# 运动权重增益 - 多人场景下增加运动一致性权重
-MOTION_WEIGHT_MULTI_PERSON = 0.6  # 多人场景 motion 权重 (body:0.4, motion:0.6)
-MOTION_WEIGHT_SINGLE_PERSON = 0.5  # 单人场景 motion 权重 (body:0.5, motion:0.5)
+LOST_CONFIRM_FRAMES = 5
+MATCH_HISTORY_SIZE = 5
+MOTION_WEIGHT_MULTI_PERSON = 0.6
+MOTION_WEIGHT_SINGLE_PERSON = 0.5
 
-# 侧脸容忍度 - 侧脸角度下人脸embedding差异大，需要更信任运动连续性
-# 当运动连续性极高时（motion > 0.95），可以容忍较低的人脸相似度
-MOTION_TRUST_THRESHOLD = 0.95  # 运动连续性信任阈值
-FACE_SIDE_VIEW_MIN = 0.35  # 侧脸最低接受阈值（配合高运动连续性）
+# 侧脸容忍度
+MOTION_TRUST_THRESHOLD = 0.95
+FACE_SIDE_VIEW_MIN = 0.35
+
+
+# ============================================
+# 人脸质量评估函数
+# ============================================
+def evaluate_face_quality(face_conf: float, face_size: int, face_sim: float) -> str:
+    """
+    评估人脸质量，返回状态: 'stable', 'unstable', 'lost'
+    
+    stable: 高置信度、大尺寸、高相似度 → 纯人脸跟随
+    unstable: 中等质量 → motion辅助判断
+    lost: 低质量或无人脸 → 切换到人体+motion
+    """
+    if face_conf is None or face_size is None:
+        return 'lost'
+    
+    if (face_conf >= FACE_STABLE_CONF and 
+        face_size >= FACE_STABLE_SIZE and 
+        (face_sim is None or face_sim >= FACE_STABLE_SIM)):
+        return 'stable'
+    elif (face_conf >= FACE_UNSTABLE_CONF and 
+          face_size >= FACE_UNSTABLE_SIZE and
+          (face_sim is None or face_sim >= FACE_UNSTABLE_SIM)):
+        return 'unstable'
+    else:
+        return 'lost'
 
 
 def extract_view_feature(
@@ -925,54 +963,51 @@ def main():
                         if learned:
                             print(f"[自动学习] {learn_reason} -> {op_info}")
             
-            # 2. 如果人体没匹配到，尝试仅通过人脸匹配（使用更严格的阈值）
+            # 2. 如果人体没匹配到，尝试仅通过人脸匹配
             # ============================================
-            # 这里处理目标状态 B: 目标仅以人脸出现
-            # 场景包括:
-            #   - 1.2: 画面只有人脸（目标远处/被遮挡）
-            #   - 2.1-B/2.2-B: 多人场景，目标人体被遮挡只露脸
-            #   - 2.3: 多个远处人脸，无人体
+            # 根据人脸质量使用不同策略:
+            #   - stable (高质量): 纯人脸匹配，阈值0.70
+            #   - unstable (中等): 人脸+motion辅助，阈值0.50
+            #   - lost (低质量): 无法匹配，等待人体出现
             # ============================================
             if not matched_any and faces and mv_recognizer.target and mv_recognizer.target.has_face_view:
-                if frame_count % 30 == 0:
-                    print(f"[DEBUG] 人体匹配失败，尝试仅人脸匹配 (阈值={FACE_ONLY_THRESHOLD})...")
                 
                 best_face_match = None
                 best_face_sim = 0.0
                 best_face_idx = -1
                 best_view_idx = -1
+                best_face_quality = 'lost'
+                best_face_conf = 0.0
+                best_face_size = 0
                 
                 # 多人脸场景需要更严格的阈值
                 multi_face_penalty = 0.05 if num_faces > 1 else 0.0
                     
                 for face_idx, face in enumerate(faces):
-                    fx1, fy1, fx2, fy2 = face.bbox
-                    fc_x, fc_y = (fx1 + fx2) / 2, (fy1 + fy2) / 2
+                    fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+                    fc_x, fc_y = (fx1 + fx2) // 2, (fy1 + fy2) // 2
+                    face_w = fx2 - fx1
+                    face_h = fy2 - fy1
+                    face_size = min(face_w, face_h)
+                    face_conf = float(face.score) if hasattr(face, 'score') else 0.5
                     
                     # 检查人脸是否在某个人体框内
                     face_in_any_person = False
-                    
                     if len(persons) > 0:
                         for p_idx, person in enumerate(persons):
-                            px1, py1, px2, py2 = person.bbox
+                            px1, py1, px2, py2 = person.bbox.astype(int)
                             if px1 <= fc_x <= px2 and py1 <= fc_y <= py2:
                                 face_in_any_person = True
                                 break
                     
-                    # 情况1: 多人场景，人脸在不匹配的人体框内 → 跳过（属于别人）
-                    # 关键：这是场景 2.1-B/2.2-B 的保护
+                    # 多人场景，人脸在不匹配的人体框内 → 跳过
                     if num_persons > 1 and face_in_any_person:
                         if frame_count % 30 == 0:
                             print(f"[DEBUG] Face[{face_idx}] 在不匹配的人体框内(多人场景)，跳过")
                         continue
                     
-                    # 情况2: 有人体但人脸不在任何人体框内 → 远处的人脸，使用更严格阈值
-                    # 场景：目标背对镜头（有人体无脸），远处有其他人的脸（有脸无人体）
+                    # 远处人脸使用更高阈值
                     is_distant_face = num_persons > 0 and not face_in_any_person
-                    current_threshold = FACE_ONLY_THRESHOLD + 0.1 + multi_face_penalty if is_distant_face else FACE_ONLY_THRESHOLD + multi_face_penalty
-                    
-                    if is_distant_face and frame_count % 30 == 0:
-                        print(f"[DEBUG] Face[{face_idx}] 不在任何人体框内(远处人脸)，使用更高阈值={current_threshold:.2f}")
                     
                     face_feature = face_recognizer.extract_feature(
                         frame, face.bbox, face.keypoints
@@ -982,37 +1017,90 @@ def main():
                         for vi, view in enumerate(mv_recognizer.target.view_features):
                             if view.has_face and view.face_embedding is not None:
                                 sim = float(np.dot(face_feature.embedding, view.face_embedding))
+                                
+                                # 评估人脸质量
+                                face_quality = evaluate_face_quality(face_conf, face_size, sim)
+                                
+                                # 根据质量决定阈值
+                                if face_quality == 'stable':
+                                    current_threshold = FACE_ONLY_THRESHOLD + multi_face_penalty
+                                    if is_distant_face:
+                                        current_threshold += 0.10
+                                elif face_quality == 'unstable':
+                                    # 不稳定人脸: 使用更低阈值，但需要motion辅助验证
+                                    current_threshold = FACE_ONLY_THRESHOLD_UNSTABLE + multi_face_penalty
+                                    if is_distant_face:
+                                        current_threshold += 0.05
+                                else:
+                                    current_threshold = 1.0  # 无法匹配
+                                
                                 if frame_count % 30 == 0:
-                                    print(f"[DEBUG] Face[{face_idx}] vs View[{vi}]: sim={sim:.3f}, threshold={current_threshold:.2f}")
-                                # 只有超过当前阈值才记录为候选
+                                    print(f"[DEBUG] Face[{face_idx}] vs View[{vi}]: sim={sim:.3f}, conf={face_conf:.2f}, size={face_size}px, quality={face_quality}, threshold={current_threshold:.2f}")
+                                
                                 if sim >= current_threshold and sim > best_face_sim:
                                     best_face_sim = sim
                                     best_face_idx = face_idx
                                     best_view_idx = vi
+                                    best_face_quality = face_quality
+                                    best_face_conf = face_conf
+                                    best_face_size = face_size
                 
-                # 使用更严格的阈值判断（已在上面的循环中过滤）
-                if best_face_sim >= FACE_ONLY_THRESHOLD:
+                # 根据人脸质量决定是否匹配成功
+                face_match_success = False
+                
+                if best_face_quality == 'stable' and best_face_sim >= FACE_ONLY_THRESHOLD:
+                    # 稳定人脸: 纯人脸匹配
+                    face_match_success = True
+                    if frame_count % 30 == 0:
+                        print(f"[DEBUG] 稳定人脸匹配成功! face_idx={best_face_idx}, sim={best_face_sim:.3f}")
+                        
+                elif best_face_quality == 'unstable' and best_face_sim >= FACE_ONLY_THRESHOLD_UNSTABLE:
+                    # 不稳定人脸: 需要motion辅助验证
+                    # 获取motion分数（使用最近的位置预测）
+                    motion_score = 0.0
+                    if mv_recognizer.last_bbox is not None and best_face_idx >= 0:
+                        # 计算人脸框与预测位置的IOU
+                        face_bbox = faces[best_face_idx].bbox
+                        pred_bbox = mv_recognizer.last_bbox
+                        
+                        # 简化: 用中心点距离代替IOU
+                        fc_x = (face_bbox[0] + face_bbox[2]) / 2
+                        fc_y = (face_bbox[1] + face_bbox[3]) / 2
+                        pc_x = (pred_bbox[0] + pred_bbox[2]) / 2
+                        pc_y = (pred_bbox[1] + pred_bbox[3]) / 2
+                        
+                        # 计算归一化距离
+                        frame_h, frame_w = frame.shape[:2]
+                        dist = np.sqrt((fc_x - pc_x)**2 + (fc_y - pc_y)**2)
+                        max_dist = np.sqrt(frame_w**2 + frame_h**2) * 0.3  # 允许30%画面距离
+                        motion_score = max(0, 1.0 - dist / max_dist)
+                    
+                    # 不稳定人脸 + motion辅助
+                    combined_score = best_face_sim * 0.6 + motion_score * 0.4
+                    if combined_score >= 0.50:  # 综合分数阈值
+                        face_match_success = True
+                        if frame_count % 30 == 0:
+                            print(f"[DEBUG] 不稳定人脸+motion匹配成功! face={best_face_sim:.2f}, motion={motion_score:.2f}, combined={combined_score:.2f}")
+                    else:
+                        if frame_count % 30 == 0:
+                            print(f"[DEBUG] 不稳定人脸+motion不足 (face={best_face_sim:.2f}, motion={motion_score:.2f}, combined={combined_score:.2f}<0.50)")
+                
+                if face_match_success:
                     matched_any = True
                     target_face_idx = best_face_idx
                     lost_frames = 0
                     
-                    # 保存当前匹配信息用于显示
                     current_match_info = {
                         'type': 'face_only',
                         'similarity': best_face_sim,
-                        'method': f'face_only (vs View[{best_view_idx}])',
-                        'threshold': FACE_ONLY_THRESHOLD
+                        'method': f'face_only_{best_face_quality} (vs View[{best_view_idx}])',
+                        'threshold': FACE_ONLY_THRESHOLD if best_face_quality == 'stable' else FACE_ONLY_THRESHOLD_UNSTABLE
                     }
                     
-                    # 用人脸框更新位置
                     mv_recognizer.update_tracking(faces[best_face_idx].bbox)
-                    if frame_count % 30 == 0:
-                        print(f"[DEBUG] 人脸匹配成功! face_idx={best_face_idx}, sim={best_face_sim:.3f}")
                     
-                    # 仅人脸匹配时的自动学习 - 更严格的条件
-                    # 只有单人场景+高人脸相似度才学习，避免多人场景误学习
-                    # 使用外层定义的 is_single_person_scene
-                    if best_face_sim >= 0.80 and is_single_person_scene:
+                    # 仅人脸匹配时的自动学习 - 只有稳定人脸才学习
+                    if best_face_quality == 'stable' and best_face_sim >= 0.80 and is_single_person_scene:
                         face_only_view = ViewFeature(timestamp=time.time())
                         face_feature = face_recognizer.extract_feature(
                             frame, faces[best_face_idx].bbox, faces[best_face_idx].keypoints
@@ -1023,11 +1111,16 @@ def main():
                             learned, op_info = mv_recognizer.auto_learn(face_only_view, faces[best_face_idx].bbox, True)
                             if learned:
                                 print(f"[自动学习] 仅人脸(sim={best_face_sim:.2f}) -> {op_info}")
-                    elif frame_count % 30 == 0 and best_face_sim >= 0.70:
-                        reason = "多人场景" if not is_single_person_scene else f"相似度不足({best_face_sim:.2f}<0.80)"
-                        print(f"[DEBUG] 仅人脸匹配不学习: {reason}")
+                    elif frame_count % 30 == 0 and best_face_sim >= 0.60:
+                        if best_face_quality == 'unstable':
+                            print(f"[DEBUG] 不稳定人脸不学习")
+                        elif not is_single_person_scene:
+                            print(f"[DEBUG] 仅人脸匹配不学习: 多人场景")
+                        else:
+                            print(f"[DEBUG] 仅人脸匹配不学习: 相似度不足({best_face_sim:.2f}<0.80)")
+                            
                 elif frame_count % 30 == 0 and best_face_sim > 0:
-                    print(f"[DEBUG] 人脸最高相似度 {best_face_sim:.3f} < 阈值 {FACE_ONLY_THRESHOLD}")
+                    print(f"[DEBUG] 人脸匹配失败: sim={best_face_sim:.3f}, quality={best_face_quality}")
             
             if not matched_any:
                 lost_frames += 1
