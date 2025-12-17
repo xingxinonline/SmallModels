@@ -58,39 +58,134 @@ class MultiViewTarget:
     face_matches: int = 0
     body_matches: int = 0
     
-    def add_view(self, view: ViewFeature, min_interval: float = 1.0) -> bool:
+    def add_view(self, view: ViewFeature, min_interval: float = 1.0) -> Tuple[bool, str]:
         """
-        添加新视角特征
+        添加新视角特征（智能替换策略）
         
         Args:
             view: 新视角特征
             min_interval: 最小时间间隔 (秒)，避免重复添加相似视角
         
         Returns:
-            是否成功添加
+            (是否成功添加, 操作描述)
         """
         if not view.is_valid:
-            return False
+            return False, "无效视角"
         
         # 检查时间间隔
         if self.view_features:
             last_time = self.view_features[-1].timestamp
             if view.timestamp - last_time < min_interval:
-                return False
+                return False, "间隔太短"
         
         # 检查是否与现有视角差异足够大
-        if self._is_different_view(view):
-            view.timestamp = time.time()
-            self.view_features.append(view)
-            
-            # 限制数量
-            if len(self.view_features) > self.max_views:
-                # 保留第一个 (初始视角) 和最新的
-                self.view_features = [self.view_features[0]] + self.view_features[-self.max_views+1:]
-            
-            return True
+        is_different, most_similar_idx, most_similar_score = self._is_different_view_with_info(view)
         
-        return False
+        if is_different:
+            view.timestamp = time.time()
+            
+            # 视角库未满，直接添加
+            if len(self.view_features) < self.max_views:
+                self.view_features.append(view)
+                return True, f"新增(总数:{len(self.view_features)})"
+            
+            # 视角库已满，智能替换
+            replace_idx = self._find_view_to_replace(view)
+            if replace_idx is not None:
+                old_view = self.view_features[replace_idx]
+                old_has_face = old_view.has_face
+                new_has_face = view.has_face
+                self.view_features[replace_idx] = view
+                return True, f"替换[{replace_idx}]({'有脸→无脸' if old_has_face and not new_has_face else '无脸→有脸' if not old_has_face and new_has_face else '同类型'})"
+            else:
+                return False, "无可替换"
+        
+        return False, f"太相似(idx={most_similar_idx},sim={most_similar_score:.2f})"
+    
+    def _find_view_to_replace(self, new_view: ViewFeature) -> Optional[int]:
+        """
+        找到最适合替换的视角索引
+        
+        替换策略优先级：
+        1. 保护背面视角：至少保留2个无人脸视角（背面/侧面）
+        2. 新视角有人脸时，替换与之最相似的有人脸视角（去除重复角度）
+        3. 新视角无人脸时，替换与之最相似的无人脸视角
+        4. 永远不替换索引0（初始锁定视角）
+        
+        Returns:
+            要替换的视角索引，如果不应替换则返回None
+        """
+        if len(self.view_features) < 2:
+            return None
+        
+        new_has_face = new_view.has_face
+        
+        # 统计各类型视角
+        face_indices = [i for i, v in enumerate(self.view_features) if v.has_face and i > 0]
+        body_only_indices = [i for i, v in enumerate(self.view_features) if not v.has_face and i > 0]
+        
+        # 保护背面视角：至少保留 MIN_BACK_VIEWS 个
+        MIN_BACK_VIEWS = 2
+        
+        # 策略1：新视角有人脸
+        if new_has_face:
+            # 优先替换与新视角最相似的有人脸视角（去除重复角度）
+            if face_indices:
+                max_sim = -1
+                max_idx = face_indices[0]
+                for idx in face_indices:
+                    sim = self._compute_view_similarity(self.view_features[idx], new_view)
+                    if sim > max_sim:
+                        max_sim = sim
+                        max_idx = idx
+                return max_idx
+            
+            # 如果没有有人脸视角可替换，检查是否可以替换无人脸视角
+            # 保护条件：至少保留 MIN_BACK_VIEWS 个无人脸视角
+            if body_only_indices and len(body_only_indices) > MIN_BACK_VIEWS:
+                return body_only_indices[0]  # 替换最老的无人脸视角
+        
+        # 策略2：新视角无人脸（背面/侧面）
+        else:
+            # 优先替换无人脸视角中与新视角最相似的
+            if body_only_indices:
+                max_sim = -1
+                max_idx = body_only_indices[0]
+                for idx in body_only_indices:
+                    sim = self._compute_view_similarity(self.view_features[idx], new_view)
+                    if sim > max_sim:
+                        max_sim = sim
+                        max_idx = idx
+                return max_idx
+            
+            # 如果只有有人脸视角，检查是否过多
+            # 如果有人脸视角超过一半，可以替换最老的有人脸视角
+            if len(face_indices) > self.max_views // 2:
+                return face_indices[0]  # 替换最老的有人脸视角（保留初始视角）
+        
+        return None
+    
+    def _is_different_view_with_info(self, new_view: ViewFeature, threshold: float = 0.7) -> Tuple[bool, int, float]:
+        """
+        检查是否为不同视角，并返回最相似的视角信息
+        
+        Returns:
+            (是否不同, 最相似视角索引, 最相似度)
+        """
+        if not self.view_features:
+            return True, -1, 0.0
+        
+        max_sim = -1.0
+        max_idx = 0
+        
+        for i, existing in enumerate(self.view_features):
+            sim = self._compute_view_similarity(existing, new_view)
+            if sim > max_sim:
+                max_sim = sim
+                max_idx = i
+        
+        is_different = max_sim < threshold
+        return is_different, max_idx, max_sim
     
     def _is_different_view(self, new_view: ViewFeature, threshold: float = 0.7) -> bool:
         """检查是否为不同视角 (与所有已有视角相似度都低于阈值)"""
@@ -158,9 +253,11 @@ class MultiViewTarget:
 @dataclass 
 class MultiViewConfig:
     """多视角识别器配置"""
-    # 特征权重
+    # 特征权重 (动态调整，有高置信人脸时增加人脸权重)
     face_weight: float = 0.6
     body_weight: float = 0.4
+    face_priority_threshold: float = 0.65  # 人脸相似度超过此值时，增加人脸权重
+    face_priority_weight: float = 0.85  # 高置信人脸时的权重
     
     # 阈值
     face_threshold: float = 0.45
@@ -172,6 +269,10 @@ class MultiViewConfig:
     max_motion_distance: float = 150  # 最大位移 (像素)
     motion_time_window: float = 0.5  # 时间窗口 (秒)
     
+    # 多人场景保护
+    require_face_body_consistency: bool = True  # 人脸-人体一致性检查
+    multi_person_face_priority: bool = True  # 多人场景下优先信任人脸
+    
     # 时域平滑
     smooth_window: int = 5  # 多帧投票窗口
     confirm_threshold: int = 3  # 确认需要的帧数
@@ -180,8 +281,10 @@ class MultiViewConfig:
     auto_learn: bool = True
     learn_interval: float = 2.0  # 自动学习间隔 (秒)
     
-    # 颜色权重 (降低头部)
+    # 颜色权重 - 正面 (头部少)
     part_weights: List[float] = field(default_factory=lambda: [0.05, 0.15, 0.20, 0.20, 0.25, 0.15])
+    # 颜色权重 - 背面 (增加下半身权重，因为背面上半身特征不明显)
+    back_part_weights: List[float] = field(default_factory=lambda: [0.05, 0.10, 0.15, 0.25, 0.30, 0.15])
 
 
 class MultiViewRecognizer:
@@ -200,7 +303,7 @@ class MultiViewRecognizer:
     def set_target(self, view: ViewFeature, bbox: np.ndarray) -> None:
         """设置目标"""
         self.target = MultiViewTarget()
-        self.target.add_view(view)
+        self.target.add_view(view)  # 初始视角，忽略返回值
         self.target.update_position(bbox)
         self.match_history.clear()
         self.last_learn_time = time.time()
@@ -255,12 +358,22 @@ class MultiViewRecognizer:
         motion_sim = self._compute_motion_consistency(candidate_bbox)
         details['motion_sim'] = motion_sim
         
-        # 4. 融合策略
+        # 4. 融合策略 - 动态权重调整
         if face_sim is not None and face_sim > 0.3:
-            # 有人脸参与
-            base_sim = face_sim * self.config.face_weight + best_body_sim * self.config.body_weight
+            # 有人脸参与 - 动态调整权重
+            if self.config.multi_person_face_priority and face_sim >= self.config.face_priority_threshold:
+                # 高置信人脸时，大幅增加人脸权重
+                fw = self.config.face_priority_weight  # 默认 0.85
+                bw = 1.0 - fw - self.config.motion_weight
+                method_prefix = "face_priority"
+            else:
+                fw = self.config.face_weight
+                bw = self.config.body_weight
+                method_prefix = "fused"
+            
+            base_sim = face_sim * fw + best_body_sim * bw
             similarity = base_sim + motion_sim * self.config.motion_weight
-            method = f"fused (F:{face_sim:.2f} B:{best_body_sim:.2f} M:{motion_sim:.2f})"
+            method = f"{method_prefix} (F:{face_sim:.2f}*{fw:.2f} B:{best_body_sim:.2f}*{bw:.2f} M:{motion_sim:.2f})"
         else:
             # 纯人体 + 运动
             similarity = best_body_sim * (1 - self.config.motion_weight) + motion_sim * self.config.motion_weight
@@ -290,8 +403,12 @@ class MultiViewRecognizer:
             bc = cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA)
             color_sims.append(1.0 - bc)
         
-        # 使用配置的权重
-        weights = self.config.part_weights[:num_parts]
+        # 根据视角选择权重：背面（无人脸）使用 back_part_weights
+        is_back_view = not target_view.has_face or not candidate.has_face
+        if is_back_view and hasattr(self.config, 'back_part_weights'):
+            weights = self.config.back_part_weights[:num_parts]
+        else:
+            weights = self.config.part_weights[:num_parts]
         weights = np.array(weights) / sum(weights)
         color_sim = float(np.dot(color_sims, weights))
         
@@ -379,15 +496,21 @@ class MultiViewRecognizer:
     def is_same_target(
         self,
         candidate: ViewFeature,
-        candidate_bbox: np.ndarray
+        candidate_bbox: np.ndarray,
+        update_history: bool = False  # 是否更新时域平滑历史
     ) -> Tuple[bool, float, str]:
         """
-        判断是否为同一目标 (带时域平滑)
+        判断是否为同一目标 (可选时域平滑)
+        
+        Args:
+            candidate: 候选特征
+            candidate_bbox: 候选边界框
+            update_history: 是否更新匹配历史（只有最终选定的匹配才应该更新）
         """
         similarity, method, details = self.compute_similarity(candidate, candidate_bbox)
         
-        # 选择阈值
-        if "fused" in method:
+        # 选择阈值 - face_priority 也算融合匹配
+        if "fused" in method or "face_priority" in method:
             threshold = self.config.fused_threshold
         elif details.get('face_sim') is not None:
             threshold = self.config.face_threshold
@@ -396,44 +519,56 @@ class MultiViewRecognizer:
         
         is_match = similarity >= threshold
         
-        # 时域平滑 (多帧投票)
-        self.match_history.append(1 if is_match else 0)
-        
-        if len(self.match_history) >= self.config.smooth_window:
-            vote_count = sum(self.match_history)
-            smoothed_match = vote_count >= self.config.confirm_threshold
+        # 时域平滑 (多帧投票) - 只有确认匹配时才更新历史
+        if update_history:
+            self.match_history.append(1 if is_match else 0)
+            
+            if len(self.match_history) >= self.config.smooth_window:
+                vote_count = sum(self.match_history)
+                smoothed_match = vote_count >= self.config.confirm_threshold
+            else:
+                smoothed_match = is_match
+            
+            return smoothed_match, similarity, method
         else:
-            smoothed_match = is_match
-        
-        return smoothed_match, similarity, method
+            # 不更新历史，直接返回原始结果
+            return is_match, similarity, method
+    
+    def clear_match_history(self):
+        """清空匹配历史（目标切换或丢失时调用）"""
+        self.match_history.clear()
     
     def auto_learn(
         self,
         candidate: ViewFeature,
         candidate_bbox: np.ndarray,
         is_match: bool
-    ) -> bool:
+    ) -> Tuple[bool, str]:
         """
         自动学习新视角
         
         如果匹配成功且距离上次学习超过间隔，尝试添加新视角
+        
+        Returns:
+            (是否学习成功, 操作描述)
         """
         if not self.config.auto_learn:
-            return False
+            return False, "自动学习已禁用"
         
         if not is_match or self.target is None:
-            return False
+            return False, "未匹配或无目标"
         
         current_time = time.time()
         if current_time - self.last_learn_time < self.config.learn_interval:
-            return False
+            return False, "间隔太短"
         
         # 尝试添加新视角
-        if self.target.add_view(candidate, min_interval=self.config.learn_interval):
+        added, reason = self.target.add_view(candidate, min_interval=self.config.learn_interval)
+        if added:
             self.last_learn_time = current_time
-            return True
+            return True, reason
         
-        return False
+        return False, reason
     
     def update_tracking(self, bbox: np.ndarray) -> None:
         """更新跟踪状态"""
