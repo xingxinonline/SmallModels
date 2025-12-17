@@ -71,6 +71,10 @@ AUTO_LEARN_CONFIRM_FRAMES = 1  # 自动学习不需要连续帧（高置信度�
 # 视角库最大容量 - 防止特征库无限膨胀
 MAX_VIEW_COUNT = 8  # 最多保存8个视角
 
+# 人脸有效尺寸 - 小人脸embedding质量差，容易误识别
+MIN_FACE_SIZE = 40  # 人脸最小边长(像素)
+MIN_FACE_SIZE_FOR_LEARN = 50  # 学习时人脸最小边长(更严格)
+
 # 侧脸容忍度 - 侧脸角度下人脸embedding差异大，需要更信任运动连续性
 # 当运动连续性极高时（motion > 0.95），可以容忍较低的人脸相似度
 MOTION_TRUST_THRESHOLD = 0.95  # 运动连续性信任阈值
@@ -656,8 +660,8 @@ def main():
                     # 简化的匹配逻辑（防止误跟踪他人）
                     # ============================================
                     # 核心思路:
-                    #   1. 人脸 > 阈值 → 靠人脸判断
-                    #   2. 人脸 < 阈值 → 靠 motion + body 判断
+                    #   1. 人脸 > 阈值 且 尺寸够大 → 靠人脸判断
+                    #   2. 人脸 < 阈值 或 尺寸太小 → 靠 motion + body 判断
                     #   3. motion + body 都低 → 目标丢失
                     # ============================================
                     
@@ -665,12 +669,31 @@ def main():
                     BODY_MOTION_THRESHOLD = 0.65  # body + motion 综合阈值
                     MULTI_PERSON_BODY_THRESHOLD = 0.70  # 多人场景下仅body匹配的阈值
                     
+                    # 检查人脸尺寸是否足够大
+                    face_size_valid = False
+                    current_face_size = 0
+                    for face in faces:
+                        fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+                        fc_x, fc_y = (fx1 + fx2) // 2, (fy1 + fy2) // 2
+                        px1, py1, px2, py2 = person.bbox.astype(int)
+                        if px1 <= fc_x <= px2 and py1 <= fc_y <= py2:
+                            face_w = fx2 - fx1
+                            face_h = fy2 - fy1
+                            current_face_size = min(face_w, face_h)
+                            face_size_valid = current_face_size >= MIN_FACE_SIZE
+                            break
+                    
                     # 计算 body + motion 综合分数
                     body_motion_score = body_sim * 0.5 + motion_score * 0.5
                     
-                    # 判断匹配类型
-                    face_matched = face_sim is not None and face_sim >= FACE_MATCH_THRESHOLD
+                    # 判断匹配类型 (人脸有效 = 相似度高 且 尺寸够大)
+                    face_matched = (face_sim is not None and 
+                                    face_sim >= FACE_MATCH_THRESHOLD and 
+                                    face_size_valid)
                     body_motion_matched = body_motion_score >= BODY_MOTION_THRESHOLD
+                    
+                    if frame_count % 30 == 0 and face_sim is not None:
+                        print(f"[DEBUG] Person[{idx}] face_size={current_face_size}px, valid={face_size_valid}, face_matched={face_matched}")
                     
                     # 决策逻辑
                     accept = False
@@ -740,8 +763,8 @@ def main():
                         print(f"[DEBUG] 选择body+motion匹配 Person[{best_match[0]}], B:{best_match[7]:.2f}, M:{best_match[8]:.2f}")
                 
                 if best_match:
-                    # 解包: (idx, similarity, method, view, face_in_person, face_verified, face_sim, body_sim)
-                    idx, similarity, method, view, face_in_person, face_verified, match_face_sim, match_body_sim = best_match
+                    # 解包: (idx, similarity, method, view, face_in_person, face_matched, face_sim, body_sim, motion_score, match_type)
+                    idx, similarity, method, view, face_in_person, face_matched, match_face_sim, match_body_sim, match_motion_score, match_type = best_match
                     matched_any = True
                     target_person_idx = idx
                     lost_frames = 0
@@ -751,7 +774,8 @@ def main():
                         'type': 'person',
                         'similarity': similarity,
                         'method': method,
-                        'threshold': mv_recognizer.config.fused_threshold if 'fused' in method or 'face_priority' in method else mv_recognizer.config.body_threshold
+                        'match_type': match_type,  # "face" or "body_motion"
+                        'threshold': FACE_MATCH_THRESHOLD if match_type == "face" else BODY_MOTION_THRESHOLD
                     }
                     
                     # 更新跟踪
@@ -796,6 +820,20 @@ def main():
                         BODY_MOTION_LEARN_THRESHOLD = 0.70  # body+motion 学习阈值
                         FACE_MIN_FOR_BODY_LEARN = 0.50  # 学习body时人脸的最低要求
                         
+                        # 检查当前人脸尺寸是否足够大（用于学习）
+                        current_face_size_for_learn = 0
+                        face_size_ok_for_learn = False
+                        for face in faces:
+                            fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+                            fc_x, fc_y = (fx1 + fx2) // 2, (fy1 + fy2) // 2
+                            px1, py1, px2, py2 = persons[idx].bbox.astype(int)
+                            if px1 <= fc_x <= px2 and py1 <= fc_y <= py2:
+                                face_w = fx2 - fx1
+                                face_h = fy2 - fy1
+                                current_face_size_for_learn = min(face_w, face_h)
+                                face_size_ok_for_learn = current_face_size_for_learn >= MIN_FACE_SIZE_FOR_LEARN
+                                break
+                        
                         # Case 1: 人脸匹配通过 → 可以学习body
                         if match_type == "face":
                             # 人脸匹配 + body+motion高 → 学习body（如果目标还没有body或需要更新）
@@ -808,20 +846,20 @@ def main():
                                 else:
                                     if frame_count % 30 == 0:
                                         print(f"[DEBUG] 人脸不在人体框内，不学习body")
-                            elif match_face_sim >= FACE_LEARN_THRESHOLD_LOCAL:
-                                # 人脸够高，直接学习当前视角
+                            elif match_face_sim >= FACE_LEARN_THRESHOLD_LOCAL and face_size_ok_for_learn:
+                                # 人脸够高 + 尺寸够大 → 直接学习当前视角
                                 should_learn = True
                                 learn_what = "face"
-                                learn_reason = f"人脸高置信(F:{match_face_sim:.2f})"
+                                learn_reason = f"人脸高置信(F:{match_face_sim:.2f}, size={current_face_size_for_learn}px)"
                         
                         # Case 2: body+motion匹配通过 → 可以学习人脸
                         elif match_type == "body_motion":
-                            # body+motion匹配 + 有人脸且>某值 → 学习人脸
-                            if face_in_person and match_face_sim >= FACE_MIN_FOR_BODY_LEARN:
-                                # 关键约束：人脸必须在人体框内！
+                            # body+motion匹配 + 有人脸且>某值 + 人脸尺寸够大 → 学习人脸
+                            if face_in_person and match_face_sim >= FACE_MIN_FOR_BODY_LEARN and face_size_ok_for_learn:
+                                # 关键约束：人脸必须在人体框内 且 尺寸足够大！
                                 should_learn = True
                                 learn_what = "face"
-                                learn_reason = f"body+motion匹配(BM:{body_motion_combined:.2f})学习face(F:{match_face_sim:.2f})"
+                                learn_reason = f"body+motion匹配(BM:{body_motion_combined:.2f})学习face(F:{match_face_sim:.2f}, size={current_face_size_for_learn}px)"
                             elif not face_in_person and body_motion_combined >= BODY_MOTION_LEARN_THRESHOLD:
                                 # 纯背面/侧面，学习body视角
                                 should_learn = True
