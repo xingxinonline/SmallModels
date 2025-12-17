@@ -700,28 +700,41 @@ def main():
                             elif face_sim < FACE_REJECT_THRESHOLD:
                                 # 人脸相似度太低，且不满足极端侧脸条件
                                 # 多人场景：直接拒绝
-                                # 单人场景：如果body够高，仍然信任
+                                # 单人场景：使用 body + motion 综合评分
                                 if is_multi_person_scene:
                                     if frame_count % 30 == 0:
                                         print(f"[DEBUG] Person[{idx}] 多人场景人脸不匹配({face_sim:.2f}<{FACE_REJECT_THRESHOLD}), 拒绝")
                                     continue
-                                elif body_sim < HIGH_BODY_TRUST_THRESHOLD:
-                                    if frame_count % 30 == 0:
-                                        print(f"[DEBUG] Person[{idx}] 单人场景人脸不匹配({face_sim:.2f})且body不够({body_sim:.2f}<{HIGH_BODY_TRUST_THRESHOLD}), 拒绝")
-                                    continue
                                 else:
-                                    if frame_count % 30 == 0:
-                                        print(f"[DEBUG] Person[{idx}] 单人场景人脸低({face_sim:.2f})但body高({body_sim:.2f}), 信任body")
-                                    # 通过
+                                    # 单人场景：综合评分 = body*0.5 + motion*0.5
+                                    # 这比单独要求 body >= 0.78 更合理
+                                    # 例如：body=0.65, motion=0.87 → 综合=0.76
+                                    combined_score = body_sim * 0.5 + motion_score * 0.5
+                                    COMBINED_TRUST_THRESHOLD = 0.70  # 综合评分阈值
+                                    
+                                    if combined_score >= COMBINED_TRUST_THRESHOLD:
+                                        if frame_count % 30 == 0:
+                                            print(f"[DEBUG] Person[{idx}] 单人场景人脸低({face_sim:.2f})但综合高(B:{body_sim:.2f}+M:{motion_score:.2f}={combined_score:.2f}), 信任")
+                                        # 通过
+                                    elif body_sim >= HIGH_BODY_TRUST_THRESHOLD:
+                                        # body 单独够高也信任
+                                        if frame_count % 30 == 0:
+                                            print(f"[DEBUG] Person[{idx}] 单人场景人脸低({face_sim:.2f})但body高({body_sim:.2f}), 信任body")
+                                        # 通过
+                                    else:
+                                        if frame_count % 30 == 0:
+                                            print(f"[DEBUG] Person[{idx}] 单人场景人脸不匹配({face_sim:.2f})且综合不够({combined_score:.2f}<{COMBINED_TRUST_THRESHOLD}), 拒绝")
+                                        continue
                             elif face_sim < FACE_UNCERTAIN_THRESHOLD:
-                                # 人脸不确定，需要 body 高才能信任
-                                if body_sim >= HIGH_BODY_TRUST_THRESHOLD:
+                                # 人脸不确定，需要 body 或 综合分数 够高才能信任
+                                combined_score = body_sim * 0.5 + motion_score * 0.5
+                                if body_sim >= HIGH_BODY_TRUST_THRESHOLD or (is_single_person_scene and combined_score >= 0.68):
                                     if frame_count % 30 == 0:
-                                        print(f"[DEBUG] Person[{idx}] 人脸不确定({face_sim:.2f})但body高({body_sim:.2f}>={HIGH_BODY_TRUST_THRESHOLD}), 信任body")
+                                        print(f"[DEBUG] Person[{idx}] 人脸不确定({face_sim:.2f})但body/综合高(B:{body_sim:.2f}, M:{motion_score:.2f}), 信任")
                                     # 继续处理
                                 else:
                                     if frame_count % 30 == 0:
-                                        print(f"[DEBUG] Person[{idx}] 人脸不确定({face_sim:.2f})且body不够高({body_sim:.2f}<{HIGH_BODY_TRUST_THRESHOLD}), 跳过")
+                                        print(f"[DEBUG] Person[{idx}] 人脸不确定({face_sim:.2f})且body/综合不够(B:{body_sim:.2f}<{HIGH_BODY_TRUST_THRESHOLD}), 跳过")
                                     continue
                         else:
                             # face_sim 为 None（目标没有人脸embedding可比较，但候选有人脸）
