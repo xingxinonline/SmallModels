@@ -636,175 +636,108 @@ def main():
                 face_sim = details.get('face_sim')  # 可能为 None（候选人没有人脸）
                 body_sim = details.get('body_sim', 0.0)
                 
+                # 提取运动连续性分数
+                motion_score = details.get('motion_sim', 0.0)
+                if 'M:' in method:
+                    try:
+                        motion_str = method.split('M:')[1].split(')')[0].split(' ')[0]
+                        motion_score = float(motion_str)
+                    except:
+                        pass
+                
                 if frame_count % 30 == 0:
                     face_str = f"F:{face_sim:.2f}" if face_sim is not None else "F:None"
-                    print(f"[DEBUG] Person[{idx}] match: is_match={is_match}, sim={similarity:.3f}, {face_str}, B:{body_sim:.2f}, method={method}")
+                    print(f"[DEBUG] Person[{idx}] match: is_match={is_match}, sim={similarity:.3f}, {face_str}, B:{body_sim:.2f}, M:{motion_score:.2f}, method={method}")
                 
                 if is_match:
                     face_in_person = view.has_face and view.face_embedding is not None
-                    face_verified = 'face_priority' in method or 'fused' in method
-                    
-                    # 提取运动连续性分数（从 method 字符串中解析或使用默认值）
-                    motion_score = details.get('motion_sim', 0.0)
-                    if 'M:' in method:
-                        try:
-                            motion_str = method.split('M:')[1].split(')')[0].split(' ')[0]
-                            motion_score = float(motion_str)
-                        except:
-                            pass
                     
                     # ============================================
-                    # 关键保护逻辑（防止误跟踪他人）
+                    # 简化的匹配逻辑（防止误跟踪他人）
                     # ============================================
-                    # 分两种情况：
-                    # Case 1: 目标有脸 + 候选有脸 + 人脸验证失败 → 可能是其他人
-                    # Case 2: 目标有脸 + 候选无脸 → 可能是目标背面或其他人背面
-                    # 
-                    # 新增：极端侧脸容忍机制
-                    # - 当运动连续性极高 (motion > 0.95) + body匹配高 时，可能是用户转身
-                    # - 侧脸/profile的face embedding与正脸差异极大，可能只有0.01~0.30
-                    # - 这不代表是不同的人，而是同一个人的不同角度
+                    # 核心思路:
+                    #   1. 人脸 > 阈值 → 靠人脸判断
+                    #   2. 人脸 < 阈值 → 靠 motion + body 判断
+                    #   3. motion + body 都低 → 目标丢失
+                    # ============================================
                     
-                    FACE_REJECT_THRESHOLD = 0.40   # 低于此值需要额外验证
-                    FACE_UNCERTAIN_THRESHOLD = 0.60  # 人脸验证阈值
-                    HIGH_BODY_TRUST_THRESHOLD = 0.78  # body 高时信任（降低以容忍转身）
-                    BACK_VIEW_BODY_THRESHOLD = 0.70  # 目标有脸但候选无脸时的body阈值
-                    EXTREME_PROFILE_BODY_THRESHOLD = 0.75  # 极端侧脸时的body阈值
+                    FACE_MATCH_THRESHOLD = 0.55  # 人脸匹配阈值
+                    BODY_MOTION_THRESHOLD = 0.65  # body + motion 综合阈值
+                    MULTI_PERSON_BODY_THRESHOLD = 0.70  # 多人场景下仅body匹配的阈值
                     
-                    # 侧脸容忍：运动连续性极高时放宽人脸要求
-                    high_motion_trust = motion_score >= MOTION_TRUST_THRESHOLD
+                    # 计算 body + motion 综合分数
+                    body_motion_score = body_sim * 0.5 + motion_score * 0.5
                     
-                    # Case 1: 目标有脸 + 候选有脸 + 人脸验证失败
-                    if target_has_face and face_in_person and not face_verified:
-                        if face_sim is not None:
-                            # ====== 极端侧脸检测 ======
-                            # 当 face_sim 极低（<0.35）但 motion 和 body 都很高时
-                            # 这通常是用户转身导致的，不是不同的人
-                            is_extreme_profile = (
-                                face_sim < FACE_SIDE_VIEW_MIN and  # 人脸相似度极低
-                                high_motion_trust and  # 运动连续性极高
-                                body_sim >= EXTREME_PROFILE_BODY_THRESHOLD and  # body匹配度高
-                                is_single_person_scene  # 单人场景
-                            )
-                            
-                            if is_extreme_profile:
-                                # 极端侧脸情况：信任 motion + body 组合
-                                if frame_count % 30 == 0:
-                                    print(f"[DEBUG] Person[{idx}] 极端侧脸: F:{face_sim:.2f}, B:{body_sim:.2f}, M:{motion_score:.2f}, 信任motion+body")
-                                # 通过，继续处理
-                            # 普通侧脸容忍：运动连续性极高 + 人脸不是完全不匹配 → 信任运动
-                            elif high_motion_trust and face_sim >= FACE_SIDE_VIEW_MIN and is_single_person_scene:
-                                if frame_count % 30 == 0:
-                                    print(f"[DEBUG] Person[{idx}] 侧脸容忍: F:{face_sim:.2f}>={FACE_SIDE_VIEW_MIN}, M:{motion_score:.2f}>={MOTION_TRUST_THRESHOLD}, 信任运动")
-                                # 通过，继续处理
-                            elif face_sim < FACE_REJECT_THRESHOLD:
-                                # 人脸相似度太低，且不满足极端侧脸条件
-                                # 多人场景：直接拒绝
-                                # 单人场景：使用 body + motion 综合评分
-                                if is_multi_person_scene:
-                                    if frame_count % 30 == 0:
-                                        print(f"[DEBUG] Person[{idx}] 多人场景人脸不匹配({face_sim:.2f}<{FACE_REJECT_THRESHOLD}), 拒绝")
-                                    continue
-                                else:
-                                    # 单人场景：综合评分 = body*0.5 + motion*0.5
-                                    # 这比单独要求 body >= 0.78 更合理
-                                    # 例如：body=0.65, motion=0.87 → 综合=0.76
-                                    combined_score = body_sim * 0.5 + motion_score * 0.5
-                                    COMBINED_TRUST_THRESHOLD = 0.70  # 综合评分阈值
-                                    
-                                    if combined_score >= COMBINED_TRUST_THRESHOLD:
-                                        if frame_count % 30 == 0:
-                                            print(f"[DEBUG] Person[{idx}] 单人场景人脸低({face_sim:.2f})但综合高(B:{body_sim:.2f}+M:{motion_score:.2f}={combined_score:.2f}), 信任")
-                                        # 通过
-                                    elif body_sim >= HIGH_BODY_TRUST_THRESHOLD:
-                                        # body 单独够高也信任
-                                        if frame_count % 30 == 0:
-                                            print(f"[DEBUG] Person[{idx}] 单人场景人脸低({face_sim:.2f})但body高({body_sim:.2f}), 信任body")
-                                        # 通过
-                                    else:
-                                        if frame_count % 30 == 0:
-                                            print(f"[DEBUG] Person[{idx}] 单人场景人脸不匹配({face_sim:.2f})且综合不够({combined_score:.2f}<{COMBINED_TRUST_THRESHOLD}), 拒绝")
-                                        continue
-                            elif face_sim < FACE_UNCERTAIN_THRESHOLD:
-                                # 人脸不确定，需要 body 或 综合分数 够高才能信任
-                                combined_score = body_sim * 0.5 + motion_score * 0.5
-                                if body_sim >= HIGH_BODY_TRUST_THRESHOLD or (is_single_person_scene and combined_score >= 0.68):
-                                    if frame_count % 30 == 0:
-                                        print(f"[DEBUG] Person[{idx}] 人脸不确定({face_sim:.2f})但body/综合高(B:{body_sim:.2f}, M:{motion_score:.2f}), 信任")
-                                    # 继续处理
-                                else:
-                                    if frame_count % 30 == 0:
-                                        print(f"[DEBUG] Person[{idx}] 人脸不确定({face_sim:.2f})且body/综合不够(B:{body_sim:.2f}<{HIGH_BODY_TRUST_THRESHOLD}), 跳过")
-                                    continue
-                        else:
-                            # face_sim 为 None（目标没有人脸embedding可比较，但候选有人脸）
-                            if frame_count % 30 == 0:
-                                print(f"[DEBUG] Person[{idx}] 异常状态: target有人脸但无法计算face_sim")
-                            continue
+                    # 判断匹配类型
+                    face_matched = face_sim is not None and face_sim >= FACE_MATCH_THRESHOLD
+                    body_motion_matched = body_motion_score >= BODY_MOTION_THRESHOLD
                     
-                    # Case 2: 目标有脸 + 候选无脸 → 可能是目标背面，需要更严格的body阈值
-                    # 这里不是跳过，而是在后续选择时应用更严格的阈值
-                    # 但如果是多人场景，需要特别小心
-                    elif target_has_face and not face_in_person:
-                        # 候选人没有人脸（背面/侧面）
-                        # 多人场景下需要更高的body阈值
+                    # 决策逻辑
+                    accept = False
+                    match_type = ""
+                    
+                    if face_matched:
+                        # Case 1: 人脸匹配 → 直接信任
+                        accept = True
+                        match_type = "face"
+                        if frame_count % 30 == 0:
+                            print(f"[DEBUG] Person[{idx}] 人脸匹配通过 (F:{face_sim:.2f}>={FACE_MATCH_THRESHOLD})")
+                    elif target_has_face and face_in_person and face_sim is not None and face_sim < 0.30:
+                        # Case 2: 目标有脸 + 候选有脸 + 人脸明确不匹配 → 多人场景拒绝，单人场景看body+motion
                         if is_multi_person_scene:
-                            if body_sim < BACK_VIEW_BODY_THRESHOLD:
-                                if frame_count % 30 == 0:
-                                    print(f"[DEBUG] Person[{idx}] 多人场景背面匹配body不足({body_sim:.2f}<{BACK_VIEW_BODY_THRESHOLD}), 跳过")
-                                continue
-                        # 单人场景下，如果有其他人脸在画面中，也要小心
-                        elif num_faces > 0:
-                            # 画面中有人脸但不在这个人体框内，可能这不是目标
-                            # 需要适当提高阈值
-                            SINGLE_WITH_OTHER_FACE_THRESHOLD = 0.65
-                            if body_sim < SINGLE_WITH_OTHER_FACE_THRESHOLD:
-                                if frame_count % 30 == 0:
-                                    print(f"[DEBUG] Person[{idx}] 画面有其他人脸，背面匹配body不足({body_sim:.2f}<{SINGLE_WITH_OTHER_FACE_THRESHOLD}), 跳过")
-                                continue
+                            if frame_count % 30 == 0:
+                                print(f"[DEBUG] Person[{idx}] 多人场景人脸明确不匹配(F:{face_sim:.2f}<0.30), 拒绝")
+                            accept = False
+                        elif body_motion_matched:
+                            accept = True
+                            match_type = "body_motion"
+                            if frame_count % 30 == 0:
+                                print(f"[DEBUG] Person[{idx}] 单人场景人脸低(F:{face_sim:.2f})但body+motion高({body_motion_score:.2f}), 通过")
+                        else:
+                            if frame_count % 30 == 0:
+                                print(f"[DEBUG] Person[{idx}] 单人场景人脸低且body+motion不足({body_motion_score:.2f}<{BODY_MOTION_THRESHOLD}), 拒绝")
+                            accept = False
+                    elif body_motion_matched:
+                        # Case 3: 人脸不够但 body+motion 够 → 通过
+                        # 多人场景需要更高的 body 阈值
+                        if is_multi_person_scene and target_has_face and body_sim < MULTI_PERSON_BODY_THRESHOLD:
+                            if frame_count % 30 == 0:
+                                print(f"[DEBUG] Person[{idx}] 多人场景无人脸验证且body不足({body_sim:.2f}<{MULTI_PERSON_BODY_THRESHOLD}), 拒绝")
+                            accept = False
+                        else:
+                            accept = True
+                            match_type = "body_motion"
+                            if frame_count % 30 == 0:
+                                print(f"[DEBUG] Person[{idx}] body+motion匹配通过 (B:{body_sim:.2f}+M:{motion_score:.2f}={body_motion_score:.2f})")
+                    else:
+                        # Case 4: 人脸和body+motion都不够 → 拒绝
+                        if frame_count % 30 == 0:
+                            face_str = f"F:{face_sim:.2f}" if face_sim is not None else "F:None"
+                            print(f"[DEBUG] Person[{idx}] 人脸和body+motion都不足 ({face_str}, BM:{body_motion_score:.2f}), 拒绝")
+                        accept = False
                     
-                    all_person_matches.append((idx, similarity, method, view, face_in_person, face_verified, face_sim, body_sim))
+                    if accept:
+                        # tuple: (idx, similarity, method, view, face_in_person, face_matched, face_sim, body_sim, motion_score, match_type)
+                        all_person_matches.append((idx, similarity, method, view, face_in_person, face_matched, face_sim, body_sim, motion_score, match_type))
             
             # 选择最佳匹配
             if all_person_matches:
-                # 多人场景策略: 优先选有人脸验证的最高分匹配
-                # tuple: (idx, similarity, method, view, face_in_person, face_verified, face_sim, body_sim)
-                matches_with_face_verified = [m for m in all_person_matches if m[5]]  # m[5] = face_verified
-                matches_without_face_verified = [m for m in all_person_matches if not m[5]]
+                # 简化策略: 优先选人脸匹配的，其次选body+motion匹配的
+                # tuple: (idx, similarity, method, view, face_in_person, face_matched, face_sim, body_sim, motion_score, match_type)
+                matches_by_face = [m for m in all_person_matches if m[9] == "face"]  # m[9] = match_type
+                matches_by_body_motion = [m for m in all_person_matches if m[9] == "body_motion"]
                 
                 best_match = None
-                if matches_with_face_verified:
-                    # 优先选有人脸验证的最高分
-                    best_match = max(matches_with_face_verified, key=lambda x: x[1])
+                if matches_by_face:
+                    # 优先选人脸匹配的最高分
+                    best_match = max(matches_by_face, key=lambda x: x[6] if x[6] is not None else 0)  # 按face_sim排序
                     if frame_count % 30 == 0 and len(all_person_matches) > 1:
-                        print(f"[DEBUG] 多人场景: 选择有人脸验证的匹配 Person[{best_match[0]}] (共{len(all_person_matches)}候选)")
-                elif matches_without_face_verified:
-                    # 没有人脸验证的匹配（候选人背面/侧面，没检测到人脸）
-                    # 策略：根据场景调整严格程度
-                    # 注意：使用统一的 is_multi_person_scene（包含 faces 数量判断）
-                    
-                    if is_multi_person_scene and target_has_face:
-                        # 多人场景 + 目标有人脸：需要较高的body阈值
-                        # 但如果运动连续性很高，可以适当放宽
-                        BODY_ONLY_STRICT_THRESHOLD = 0.72  # 降低阈值以提高连续性
-                        strict_matches = [m for m in matches_without_face_verified if m[1] >= BODY_ONLY_STRICT_THRESHOLD]
-                        if strict_matches:
-                            best_match = max(strict_matches, key=lambda x: x[1])
-                            if frame_count % 30 == 0:
-                                print(f"[DEBUG] 多人无脸验证(严格): Person[{best_match[0]}], sim={best_match[1]:.2f}>={BODY_ONLY_STRICT_THRESHOLD}")
-                        else:
-                            # 不满足严格阈值，不匹配
-                            if frame_count % 30 == 0:
-                                print(f"[DEBUG] 多人无脸验证未达到严格阈值({BODY_ONLY_STRICT_THRESHOLD}), 跳过")
-                            best_match = None
-                    else:
-                        # 单人场景 或 目标没有人脸：使用普通阈值即可
-                        best_match = max(matches_without_face_verified, key=lambda x: x[1])
-                        if frame_count % 30 == 0:
-                            print(f"[DEBUG] 单人无脸验证: Person[{best_match[0]}], sim={best_match[1]:.2f}")
-                    
-                    if frame_count % 30 == 0 and len(all_person_matches) > 1 and best_match:
-                        print(f"[DEBUG] 多人场景: 无人脸验证，选择最高分 Person[{best_match[0]}] (共{len(all_person_matches)}候选)")
+                        print(f"[DEBUG] 选择人脸匹配 Person[{best_match[0]}] (共{len(all_person_matches)}候选)")
+                elif matches_by_body_motion:
+                    # 其次选body+motion匹配的最高分
+                    best_match = max(matches_by_body_motion, key=lambda x: x[7] * 0.5 + x[8] * 0.5)  # 按body+motion排序
+                    if frame_count % 30 == 0:
+                        print(f"[DEBUG] 选择body+motion匹配 Person[{best_match[0]}], B:{best_match[7]:.2f}, M:{best_match[8]:.2f}")
                 
                 if best_match:
                     # 解包: (idx, similarity, method, view, face_in_person, face_verified, face_sim, body_sim)
@@ -824,15 +757,21 @@ def main():
                     # 更新跟踪
                     mv_recognizer.update_tracking(persons[idx].bbox)
                     
-                    # 自动学习策略 - 分场景处理
-                    # 核心原则：多人场景需要人脸验证，单人场景可以更宽松
-                    # 关键保护：多人场景下仅靠body匹配时，禁止学习！
-                    # 新增保护：限制视角库容量，防止特征膨胀污染
+                    # ============================================
+                    # 简化的自动学习策略
+                    # ============================================
+                    # 核心原则：
+                    #   1. 人脸匹配 + body不匹配但motion+body高 → 学习body（前提：人脸在人体框内）
+                    #   2. motion+body匹配 + 人脸低但>某值 → 学习人脸（前提：人脸在人体框内）
+                    #   3. 关键约束：有人脸+有人体时，学习必须保证人脸在人体框内
+                    # ============================================
+                    
                     should_learn = False
+                    learn_what = ""  # "body" or "face" or "both"
                     learn_reason = ""
+                    
                     target_has_body = (mv_recognizer.target is not None and 
                                        any(v.has_body for v in mv_recognizer.target.view_features))
-                    # 使用外层统一定义的 is_single_person_scene / is_multi_person_scene
                     
                     # 容量检查：视角库已满时停止学习
                     current_view_count = mv_recognizer.target.num_views if mv_recognizer.target else 0
@@ -840,51 +779,54 @@ def main():
                         if frame_count % 60 == 0:
                             print(f"[DEBUG] 视角库已满({current_view_count}>={MAX_VIEW_COUNT})，停止学习")
                         should_learn = False
-                    # 多人场景 + 目标有人脸 + 没有人脸验证 = 禁止学习
-                    elif is_multi_person_scene and target_has_face and not face_verified:
-                        # 多人场景下仅靠body匹配，不学习，防止污染特征库
+                    # 多人场景 + 没有人脸匹配 = 禁止学习
+                    elif is_multi_person_scene and match_type != "face":
                         if frame_count % 30 == 0:
-                            print(f"[DEBUG] 多人场景无人脸验证，禁止学习 Person[{idx}]")
+                            print(f"[DEBUG] 多人场景无人脸匹配，禁止学习")
                         should_learn = False
                     else:
-                        # 使用已获取的 face_sim（无需再次解析 method 字符串）
-                        face_sim_for_learn = match_face_sim if match_face_sim is not None else 0.0
+                        # 提取匹配信息
+                        match_face_sim = best_match[6] if best_match[6] is not None else 0.0
+                        match_body_sim = best_match[7]
+                        match_motion = best_match[8]
+                        body_motion_combined = match_body_sim * 0.5 + match_motion * 0.5
                         
-                        # 根据场景选择学习阈值
-                        current_face_learn_threshold = FACE_LEARN_THRESHOLD_MULTI if is_multi_person_scene else FACE_LEARN_THRESHOLD
+                        # 学习阈值
+                        FACE_LEARN_THRESHOLD_LOCAL = 0.65  # 人脸学习阈值
+                        BODY_MOTION_LEARN_THRESHOLD = 0.70  # body+motion 学习阈值
+                        FACE_MIN_FOR_BODY_LEARN = 0.50  # 学习body时人脸的最低要求
                         
-                        # 策略1：有人脸验证时直接学习（不需要连续帧）
-                        if face_in_person and face_sim_for_learn >= current_face_learn_threshold:
-                            # 人脸在人体框内 + 人脸相似度高 -> 直接学习
-                            if not target_has_body and view.has_body:
+                        # Case 1: 人脸匹配通过 → 可以学习body
+                        if match_type == "face":
+                            # 人脸匹配 + body+motion高 → 学习body（如果目标还没有body或需要更新）
+                            if body_motion_combined >= BODY_MOTION_LEARN_THRESHOLD:
+                                # 关键约束：人脸必须在人体框内！
+                                if face_in_person:
+                                    should_learn = True
+                                    learn_what = "body"
+                                    learn_reason = f"人脸匹配(F:{match_face_sim:.2f})学习body(BM:{body_motion_combined:.2f})"
+                                else:
+                                    if frame_count % 30 == 0:
+                                        print(f"[DEBUG] 人脸不在人体框内，不学习body")
+                            elif match_face_sim >= FACE_LEARN_THRESHOLD_LOCAL:
+                                # 人脸够高，直接学习当前视角
                                 should_learn = True
-                                learn_reason = f"补充人体(F:{face_sim_for_learn:.2f}>={current_face_learn_threshold})"
-                            else:
+                                learn_what = "face"
+                                learn_reason = f"人脸高置信(F:{match_face_sim:.2f})"
+                        
+                        # Case 2: body+motion匹配通过 → 可以学习人脸
+                        elif match_type == "body_motion":
+                            # body+motion匹配 + 有人脸且>某值 → 学习人脸
+                            if face_in_person and match_face_sim >= FACE_MIN_FOR_BODY_LEARN:
+                                # 关键约束：人脸必须在人体框内！
                                 should_learn = True
-                                learn_reason = f"人脸验证(F:{face_sim_for_learn:.2f}>={current_face_learn_threshold})"
-                        
-                        # 策略2：目标没有人脸特征时，用body相似度学习
-                        # 这种情况发生在：从背面启动跟随，之后转身等
-                        # 注意：只有目标完全没有人脸时才用这个策略，否则风险太高
-                        elif not target_has_face and is_single_person_scene and similarity >= BODY_LEARN_THRESHOLD:
-                            # 目标没有人脸 + 单人场景 + body匹配度高 -> 学习新视角
-                            should_learn = True
-                            learn_reason = f"无脸目标(B:{similarity:.2f}>={BODY_LEARN_THRESHOLD})"
-                        
-                        # 策略3：单人场景无人脸时，用body相似度学习背面视角
-                        # 关键保护：必须是严格的单人场景（persons<=1 且 faces<=1）
-                        elif is_single_person_scene and not face_in_person and target_has_body and similarity >= BODY_LEARN_THRESHOLD:
-                            # 单人场景 + 没检测到人脸 + body匹配度高 -> 可能是背面，学习
-                            BACK_VIEW_LEARN_THRESHOLD = 0.70  # 背面学习阈值（提高以防误学习）
-                            if target_has_face and similarity < BACK_VIEW_LEARN_THRESHOLD:
-                                # 目标有人脸但当前没检测到人脸，需要稍高置信度
-                                if frame_count % 15 == 0:
-                                    print(f"[DEBUG] 背面学习跳过: sim={similarity:.2f} < {BACK_VIEW_LEARN_THRESHOLD} (单人无脸)")
-                            else:
+                                learn_what = "face"
+                                learn_reason = f"body+motion匹配(BM:{body_motion_combined:.2f})学习face(F:{match_face_sim:.2f})"
+                            elif not face_in_person and body_motion_combined >= BODY_MOTION_LEARN_THRESHOLD:
+                                # 纯背面/侧面，学习body视角
                                 should_learn = True
-                                learn_reason = f"单人背面(B:{similarity:.2f}>={BACK_VIEW_LEARN_THRESHOLD if target_has_face else BODY_LEARN_THRESHOLD})"
-                        
-                        # 其他情况不学习，防止污染
+                                learn_what = "body"
+                                learn_reason = f"背面匹配(BM:{body_motion_combined:.2f})"
                     
                     if should_learn:
                         learned, op_info = mv_recognizer.auto_learn(view, persons[idx].bbox, True)
