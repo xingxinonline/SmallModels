@@ -43,7 +43,7 @@ class MultiViewTarget:
     """多视角目标特征库"""
     # 视角特征列表 (最多保存 N 个不同角度)
     view_features: List[ViewFeature] = field(default_factory=list)
-    max_views: int = 10  # 默认存储10个视角
+    max_views: int = 6  # 默认存储6个视角（有脸3-4 + 无脸2）
     
     # 运动历史 (用于一致性检查)
     position_history: deque = field(default_factory=lambda: deque(maxlen=30))
@@ -58,13 +58,53 @@ class MultiViewTarget:
     face_matches: int = 0
     body_matches: int = 0
     
-    def add_view(self, view: ViewFeature, min_interval: float = 1.0) -> Tuple[bool, str]:
+    def upgrade_initial_view(self, new_view: ViewFeature, body_motion_score: float = 0.0) -> Tuple[bool, str]:
+        """
+        升级初始视角（索引0）
+        
+        场景（方案D下）：
+        1. 初始仅人脸（直播场景） → 后来有人体 → 升级为有人脸+人体视角
+        
+        注意：方案D要求启动时必须有人脸，所以不再有"初始仅人体→补人脸"的场景
+        
+        条件：
+        - body+motion >= 0.80 确保身份可靠
+        - 新视角有人体特征（且保留人脸）
+        
+        Returns:
+            (是否升级成功, 操作描述)
+        """
+        if not self.view_features:
+            return False, "无初始视角"
+        
+        initial = self.view_features[0]
+        
+        # 条件1: 初始无人脸，新视角有人脸 → 升级
+        if not initial.has_face and new_view.has_face and new_view.face_embedding is not None:
+            # 要求 body+motion 够高以确认身份
+            if body_motion_score >= 0.80:
+                # 合并：保留初始的body特征 + 新的人脸特征
+                if initial.part_color_hists is not None and new_view.part_color_hists is None:
+                    new_view.part_color_hists = initial.part_color_hists
+                new_view.timestamp = time.time()
+                self.view_features[0] = new_view
+                return True, f"升级初始视角(无脸→有脸, BM:{body_motion_score:.2f})"
+            else:
+                return False, f"BM不足({body_motion_score:.2f}<0.80)"
+        
+        # 条件2: 都有人脸，但新视角质量更好（更大、更清晰）
+        # 这个场景暂不实现，因为判断"更好"比较复杂
+        
+        return False, "不需要升级"
+    
+    def add_view(self, view: ViewFeature, min_interval: float = 1.0, replace_oldest: bool = False) -> Tuple[bool, str]:
         """
         添加新视角特征（智能替换策略）
         
         Args:
             view: 新视角特征
             min_interval: 最小时间间隔 (秒)，避免重复添加相似视角
+            replace_oldest: 是否强制启用替换模式（视角库满时主动替换最老/最差视角）
         
         Returns:
             (是否成功添加, 操作描述)
@@ -100,7 +140,39 @@ class MultiViewTarget:
             else:
                 return False, "无可替换"
         
+        # 视角太相似，但如果开启强制替换模式且视角库已满，尝试替换质量更差的
+        if replace_oldest and len(self.view_features) >= self.max_views:
+            # 在强制替换模式下，即使相似也可以替换（更新时间戳，保持多样性）
+            # 找最老的同类型视角替换
+            oldest_idx = self._find_oldest_similar_view(view)
+            if oldest_idx is not None and oldest_idx > 0:  # 不替换初始视角
+                old_view = self.view_features[oldest_idx]
+                view.timestamp = time.time()
+                self.view_features[oldest_idx] = view
+                return True, f"刷新[{oldest_idx}](相似度:{most_similar_score:.2f})"
+        
         return False, f"太相似(idx={most_similar_idx},sim={most_similar_score:.2f})"
+    
+    def _find_oldest_similar_view(self, new_view: ViewFeature) -> Optional[int]:
+        """
+        找到与新视角类型相同且最老的视角
+        
+        Returns:
+            最老同类型视角的索引，如果没有则返回None
+        """
+        new_has_face = new_view.has_face
+        oldest_idx = None
+        oldest_time = float('inf')
+        
+        for i, v in enumerate(self.view_features):
+            if i == 0:  # 跳过初始视角
+                continue
+            if v.has_face == new_has_face:  # 同类型
+                if v.timestamp < oldest_time:
+                    oldest_time = v.timestamp
+                    oldest_idx = i
+        
+        return oldest_idx
     
     def _find_view_to_replace(self, new_view: ViewFeature) -> Optional[int]:
         """
@@ -124,8 +196,8 @@ class MultiViewTarget:
         face_indices = [i for i, v in enumerate(self.view_features) if v.has_face and i > 0]
         body_only_indices = [i for i, v in enumerate(self.view_features) if not v.has_face and i > 0]
         
-        # 保护背面视角：至少保留 MIN_BACK_VIEWS 个
-        MIN_BACK_VIEWS = 2
+        # 保护背面视角：至少保留 MIN_BACK_VIEWS 个（侧身+背面）
+        MIN_BACK_VIEWS = 2  # 侧身和背面都需要保留
         
         # 策略1：新视角有人脸
         if new_has_face:
@@ -280,7 +352,7 @@ class MultiViewConfig:
     # 自动学习
     auto_learn: bool = True
     learn_interval: float = 2.0  # 自动学习间隔 (秒)
-    max_views: int = 8  # 最大视角数量，防止特征库膨胀
+    max_views: int = 6  # 最大视角数量（有脸3-4 + 无脸2）
     
     # 颜色权重 - 正面 (头部少)
     part_weights: List[float] = field(default_factory=lambda: [0.05, 0.15, 0.20, 0.20, 0.25, 0.15])
@@ -553,12 +625,19 @@ class MultiViewRecognizer:
         self,
         candidate: ViewFeature,
         candidate_bbox: np.ndarray,
-        is_match: bool
+        is_match: bool,
+        replace_mode: bool = False
     ) -> Tuple[bool, str]:
         """
         自动学习新视角
         
         如果匹配成功且距离上次学习超过间隔，尝试添加新视角
+        
+        Args:
+            candidate: 候选视角特征
+            candidate_bbox: 候选边界框
+            is_match: 是否匹配成功
+            replace_mode: 是否启用替换模式（视角库满时替换最老的视角）
         
         Returns:
             (是否学习成功, 操作描述)
@@ -574,7 +653,11 @@ class MultiViewRecognizer:
             return False, "间隔太短"
         
         # 尝试添加新视角
-        added, reason = self.target.add_view(candidate, min_interval=self.config.learn_interval)
+        added, reason = self.target.add_view(
+            candidate, 
+            min_interval=self.config.learn_interval,
+            replace_oldest=replace_mode
+        )
         if added:
             self.last_learn_time = current_time
             return True, reason
