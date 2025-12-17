@@ -2,8 +2,8 @@
 
 ## Multi-View Target Following System
 
-**版本**: v1.0  
-**日期**: 2025-12-16  
+**版本**: v2.0  
+**日期**: 2025-12-17  
 **适用硬件**: S300 Chip (NPU/DSP/MCU) / PC 预验证环境
 
 ---
@@ -16,60 +16,84 @@
 
 ### 1.2 核心特性
 
-| 特性          | 描述                                    |
-| ------------- | --------------------------------------- |
-| 多视角特征库  | 自动积累正面/侧面/背面特征，最多5个视角 |
-| 运动一致性    | 短时转身时用位置连续性维持跟踪          |
-| 人脸+人体融合 | 有人脸时融合识别，无人脸时纯人体特征    |
-| 时域平滑      | 多帧投票确认，避免单帧误判闪烁          |
-| 自动学习      | 跟踪过程中自动学习新角度                |
+| 特性          | 描述                                    | 版本 |
+| ------------- | --------------------------------------- | ---- |
+| 多视角特征库  | 自动积累正面/侧面/背面特征，最多10个视角 | v1.0 |
+| 运动一致性    | 速度/方向预测 + 步态周期特征            | v2.0 |
+| 人脸+人体融合 | 有人脸时融合识别，无人脸时纯人体特征    | v1.0 |
+| 时域平滑      | 多帧投票确认，避免单帧误判闪烁          | v1.0 |
+| 自动学习      | 跟踪过程中自动学习新角度                | v1.0 |
+| 光照归一化    | CLAHE + 灰度世界白平衡，适应光照变化    | v2.0 |
+| 场景感知状态机 | 6状态自动切换 (人脸/融合/人体/背对/搜索) | v2.0 |
+| 安全控制层    | PID + 加速度限制 + 二阶滤波             | v2.0 |
 
-### 1.3 场景适配策略
+### 1.3 场景适配策略 (v2.0 更新)
 
-| 场景     | 检测策略        | 识别策略                       | 阈值  |
-| -------- | --------------- | ------------------------------ | ----- |
-| 近距人脸 | 人脸检测为主    | 人脸embedding (MobileFaceNet)  | ≥0.45 |
-| 中距融合 | 人脸+人体双通路 | 人脸(0.6) + 人体(0.4) 权重融合 | ≥0.45 |
-| 远距人体 | 人体检测为主    | 分区颜色+LBP+运动一致性        | ≥0.45 |
-| 背对镜头 | 人体检测为主    | 多视角匹配+运动一致性          | ≥0.45 |
+**场景切换条件**: 使用 **面积比例 + 置信度双条件**，自动适配不同分辨率/焦距摄像头
+
+| 场景状态 | 进入条件 | 检测策略 | 识别策略 | 状态码 |
+| -------- | -------- | -------- | -------- | ------ |
+| **FACE_MODE** | 面积≥2% & 置信度≥0.7 | 人脸检测为主 | MobileFaceNet 512D | 近距正面 |
+| **FUSION_MODE** | 0.5%<面积<2% | 人脸+人体双通路 | 人脸(0.6)+人体(0.4) | 中距 |
+| **BODY_MODE** | 面积<0.5% | 人体检测为主 | 分区颜色+LBP+运动 | 远距 |
+| **BACK_MODE** | 无人脸 & body_sim≥0.6 | 人体检测 | 多视角匹配+步态 | 背对 |
+| **SEARCH_MODE** | 丢失≥15帧 | 全局扫描 | 人脸优先重锁 | 搜索 |
+
+> **面积比例** = bbox面积 / 画面面积，解决了固定像素阈值在不同摄像头下失效的问题
 
 ---
 
 ## 2. 系统架构
 
-### 2.1 模块组成
+### 2.1 模块组成 (v2.0 更新)
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Target Following System                   │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
-│  │ 人体检测器    │  │ 人脸检测器    │  │ 人脸识别器    │       │
-│  │ YOLOv5-Nano  │  │ SCRFD-500M   │  │ MobileFaceNet│       │
-│  │ (3.8MB)      │  │ (2.5MB)      │  │ (4.0MB)      │       │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘       │
-│         │                 │                 │                │
-│         └────────────┬────┴────────────────┘                │
-│                      ▼                                       │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │              增强版 ReID 特征提取器                   │    │
-│  │  - 6段分区颜色直方图 (LAB + HSV)                     │    │
-│  │  - LBP 纹理直方图                                    │    │
-│  │  - 几何特征 (宽高比、相对高度)                        │    │
-│  └─────────────────────┬───────────────────────────────┘    │
-│                        ▼                                     │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │              多视角目标识别器                         │    │
-│  │  - 多视角特征库 (最多5个视角)                        │    │
-│  │  - 运动一致性计算                                    │    │
-│  │  - 时域平滑 (5帧投票)                                │    │
-│  │  - 自动学习模块                                      │    │
-│  └─────────────────────┬───────────────────────────────┘    │
-│                        ▼                                     │
-│                   匹配结果输出                               │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Target Following System v2.0                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+│  │ 人体检测器    │  │ 人脸检测器    │  │ 人脸识别器    │  │ 手势检测器    │    │
+│  │ YOLOv5-Nano  │  │ SCRFD-500M   │  │ MobileFaceNet│  │ MediaPipe    │    │
+│  │ (3.8MB)      │  │ (2.5MB)      │  │ (13MB)       │  │ (需替换)     │    │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘    │
+│         │                 │                 │                 │             │
+│         └────────────┬────┴────────────────┴─────────────────┘             │
+│                      ▼                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │              增强版 ReID 特征提取器 (含光照归一化)                     │   │
+│  │  - 光照预处理: CLAHE + 灰度世界白平衡 ⭐ v2.0                        │   │
+│  │  - 6段分区颜色直方图 (LAB + HSV)                                     │   │
+│  │  - LBP 纹理直方图                                                    │   │
+│  │  - 几何特征 (宽高比、相对高度)                                        │   │
+│  └─────────────────────┬───────────────────────────────────────────────┘   │
+│                        ▼                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │              多视角目标识别器 + 运动状态                              │   │
+│  │  - 多视角特征库 (最多10个视角，保护背面) ⭐ v2.0                      │   │
+│  │  - 运动一致性: 速度/方向预测 + 步态周期 ⭐ v2.0                       │   │
+│  │  - 时域平滑 (5帧投票)                                                │   │
+│  │  - 自动学习模块                                                      │   │
+│  └─────────────────────┬───────────────────────────────────────────────┘   │
+│                        ▼                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │              场景感知状态机 ⭐ v2.0                                   │   │
+│  │  IDLE → FACE_MODE → FUSION_MODE → BODY_MODE → BACK_MODE → SEARCH    │   │
+│  │  - 面积比例 + 置信度双条件切换                                        │   │
+│  │  - 状态防抖 (最少保持5帧)                                            │   │
+│  └─────────────────────┬───────────────────────────────────────────────┘   │
+│                        ▼                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │              安全控制层 ⭐ v2.0                                       │   │
+│  │  - PID 控制器 (双轴 pan/tilt)                                        │   │
+│  │  - 加速度限制 (max=0.3)                                              │   │
+│  │  - 二阶低通滤波 (ω=10, ζ=0.7)                                        │   │
+│  │  - 死区处理 (误差<2%不输出)                                          │   │
+│  └─────────────────────┬───────────────────────────────────────────────┘   │
+│                        ▼                                                    │
+│                   控制信号输出 (云台PWM / 机器人轮速)                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.2 数据流
@@ -347,6 +371,186 @@ def auto_learn(candidate, is_match, target):
     target.view_features.append(candidate)
     return True
 ```
+
+### 3.6 光照归一化预处理 ⭐ v2.0
+
+解决 ReID 特征在光照变化下失效的问题：
+
+```python
+def normalize_illumination(image):
+    """
+    光照归一化流程:
+    1. 灰度世界白平衡 - 消除色偏
+    2. LAB 空间 CLAHE - 自适应对比度增强
+    """
+    # Step 1: 灰度世界白平衡
+    b, g, r = cv2.split(image)
+    gray_mean = (np.mean(b) + np.mean(g) + np.mean(r)) / 3
+    
+    b = np.clip(b * (gray_mean / np.mean(b)), 0, 255)
+    g = np.clip(g * (gray_mean / np.mean(g)), 0, 255)
+    r = np.clip(r * (gray_mean / np.mean(r)), 0, 255)
+    image = cv2.merge([b, g, r]).astype(np.uint8)
+    
+    # Step 2: LAB 空间 CLAHE
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge([l, a, b])
+    
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+```
+
+**配置项**:
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `use_illumination_normalization` | True | 启用光照归一化 |
+| `clahe_clip_limit` | 2.0 | CLAHE 对比度限制 |
+| `clahe_grid_size` | 8 | CLAHE 网格大小 |
+| `use_gray_world` | True | 灰度世界白平衡 |
+
+### 3.7 运动状态与步态周期 ⭐ v2.0
+
+增强版运动一致性，包含步态周期估计：
+
+```python
+class MotionState:
+    """运动状态追踪"""
+    
+    def update(self, bbox, timestamp):
+        # 更新位置和速度
+        self.velocity = (new_pos - self.position) / dt
+        self.direction = np.arctan2(vy, vx)
+        
+        # 步态周期估计 (通过 Y 坐标周期性波动)
+        self._estimate_gait()
+    
+    def _estimate_gait(self):
+        """通过 Y 坐标的过零点检测估计步态频率"""
+        y_coords = [p[1] for p in self.history_positions[-20:]]
+        y_detrend = y_coords - np.linspace(y_coords[0], y_coords[-1], len(y_coords))
+        
+        zero_crossings = np.where(np.diff(np.sign(y_detrend)))[0]
+        if len(zero_crossings) >= 2:
+            periods = np.diff(zero_crossings)
+            self.gait_frequency = 1.0 / (np.mean(periods) * 2 * dt)
+    
+    def compute_consistency(self, candidate_bbox):
+        """计算候选框与运动预测的一致性"""
+        predicted = self.position + self.velocity * dt
+        dist = np.linalg.norm(candidate_pos - predicted)
+        allowed = max(50, np.linalg.norm(self.velocity) * 0.5)
+        return max(0, 1 - dist / allowed)
+```
+
+### 3.8 场景感知状态机 ⭐ v2.0
+
+完整的 6 状态自动切换：
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE: 启动
+    
+    IDLE --> FACE_MODE: 👋手势3秒 (有人脸)
+    IDLE --> BODY_MODE: 👋手势3秒 (无人脸)
+    
+    FACE_MODE --> FUSION_MODE: 面积↓ (<2%)
+    FACE_MODE --> BODY_MODE: 人脸丢失
+    FACE_MODE --> IDLE: 👋手势停止
+    
+    FUSION_MODE --> FACE_MODE: 面积↑ (≥2%)
+    FUSION_MODE --> BODY_MODE: 面积↓ (<0.5%)
+    FUSION_MODE --> BODY_MODE: 人脸丢失
+    FUSION_MODE --> IDLE: 👋手势停止
+    
+    BODY_MODE --> FUSION_MODE: 人脸出现
+    BODY_MODE --> BACK_MODE: 转身 (无脸+body高)
+    BODY_MODE --> SEARCH_MODE: 目标丢失15帧
+    BODY_MODE --> IDLE: 👋手势停止
+    
+    BACK_MODE --> FUSION_MODE: 转正 (人脸出现)
+    BACK_MODE --> BODY_MODE: 转正 (无人脸)
+    BACK_MODE --> SEARCH_MODE: 目标丢失15帧
+    BACK_MODE --> IDLE: 👋手势停止
+    
+    SEARCH_MODE --> FACE_MODE: 重新匹配 (有人脸)
+    SEARCH_MODE --> BODY_MODE: 重新匹配 (无人脸)
+    SEARCH_MODE --> IDLE: 超时10秒
+    SEARCH_MODE --> IDLE: 👋手势停止
+    
+    note right of FACE_MODE: 近距正面<br/>人脸为主
+    note right of FUSION_MODE: 中距<br/>人脸+人体融合
+    note right of BODY_MODE: 远距<br/>人体为主
+    note right of BACK_MODE: 背对<br/>纯人体+步态
+    note right of SEARCH_MODE: 丢失目标<br/>全局扫描
+```
+
+**切换条件配置**:
+```python
+SceneSwitchConfig(
+    # 面积比例阈值
+    face_mode_area_ratio = 0.02,      # ≥2% → 人脸模式
+    body_mode_area_ratio = 0.005,     # <0.5% → 人体模式
+    
+    # 置信度阈值
+    face_confidence_threshold = 0.7,
+    body_confidence_threshold = 0.5,
+    face_similarity_threshold = 0.55,
+    body_similarity_threshold = 0.60,
+    
+    # 防抖
+    min_frames_in_state = 5,          # 最少保持5帧
+    
+    # 搜索模式
+    lost_to_search_frames = 15,       # 丢失15帧进入搜索
+    search_timeout_seconds = 10.0,    # 搜索超时10秒
+)
+```
+
+### 3.9 安全控制层 ⭐ v2.0
+
+PID 控制器 + 加速度限制 + 二阶滤波，避免近距场景电机过冲：
+
+```python
+class TargetController:
+    """目标跟随控制器"""
+    
+    def compute(self, target_bbox, frame_center):
+        # 1. 计算归一化误差 [-1, 1]
+        error_x = (target_cx - center_x) / (width / 2)
+        error_y = (target_cy - center_y) / (height / 2)
+        
+        # 2. 死区处理 (误差 < 2% 不输出)
+        if abs(error_x) < 0.02: error_x = 0
+        if abs(error_y) < 0.02: error_y = 0
+        
+        # 3. PID 计算
+        raw_pan = self.pan_pid.compute(error_x)
+        raw_tilt = self.tilt_pid.compute(error_y)
+        
+        # 4. 加速度限制
+        pan = self._limit_acceleration(raw_pan, self.prev_pan, self.velocity_pan)
+        tilt = self._limit_acceleration(raw_tilt, self.prev_tilt, self.velocity_tilt)
+        
+        # 5. 二阶低通滤波
+        pan = self.pan_filter.filter(pan)
+        tilt = self.tilt_filter.filter(tilt)
+        
+        return ControlOutput(pan, tilt)
+```
+
+**控制器配置**:
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `kp` | 0.5 | PID 比例增益 |
+| `ki` | 0.02 | PID 积分增益 |
+| `kd` | 0.1 | PID 微分增益 |
+| `max_acceleration` | 0.3 | 最大加速度 (单位/帧) |
+| `max_velocity` | 0.8 | 最大速度 (单位/帧) |
+| `filter_omega` | 10.0 | 二阶滤波自然频率 (rad/s) |
+| `filter_zeta` | 0.7 | 二阶滤波阻尼比 (临界阻尼) |
+| `deadzone` | 0.02 | 死区阈值 |
 
 ---
 
@@ -635,7 +839,7 @@ stateDiagram-v2
 
 ---
 
-## 9. 文件结构
+## 9. 文件结构 (v2.0 更新)
 
 ```
 examples/target_following/
@@ -644,15 +848,18 @@ examples/target_following/
 ├── README.md                      # 项目说明
 │
 ├── core/                          # 核心模块
-│   └── state_machine.py           # 状态机控制器 ⭐
+│   ├── state_machine.py           # 基础状态机控制器
+│   ├── scene_state_machine.py     # 场景感知状态机 ⭐ v2.0
+│   ├── controller.py              # PID 安全控制器 ⭐ v2.0
+│   └── camera.py                  # 摄像头管理
 │
 ├── detectors/                     # 检测器模块
 │   ├── yolov5_person_detector.py  # YOLOv5-Nano 人体检测
 │   ├── face_detector.py           # SCRFD 人脸检测
 │   ├── mobilefacenet_recognizer.py # MobileFaceNet 人脸识别
-│   ├── gesture_detector.py        # MediaPipe 手势检测 ⭐
-│   ├── enhanced_reid.py           # 6段增强版 ReID
-│   ├── multiview_recognizer.py    # 多视角目标识别器 ⭐
+│   ├── gesture_detector.py        # MediaPipe 手势检测 (待替换)
+│   ├── enhanced_reid.py           # 增强版 ReID (含光照归一化) ⭐ v2.0
+│   ├── multiview_recognizer.py    # 多视角目标识别器
 │   └── fused_recognizer.py        # 融合识别器
 │
 ├── tests/                         # 测试脚本
@@ -665,7 +872,7 @@ examples/target_following/
 ├── models/                        # 模型文件
 │   ├── yolov5n.onnx               # 人体检测 (3.8MB)
 │   ├── scrfd_500m_bnkps.onnx      # 人脸检测 (2.5MB)
-│   └── mobilefacenet.onnx         # 人脸识别 (4.0MB)
+│   └── mobilefacenet.onnx         # 人脸识别 (13MB)
 │
 └── docs/                          # 文档
     └── MULTIVIEW_TRACKING.md      # 本文档
@@ -675,27 +882,129 @@ examples/target_following/
 
 ## 10. 后续优化方向
 
-### 9.1 短期优化
+### 10.1 已完成 ✅
+
+- [x] 多视角特征库 (最多10个视角)
+- [x] 场景感知状态机 (6状态自动切换)
+- [x] 光照归一化预处理 (CLAHE + 灰度世界白平衡)
+- [x] 增强运动一致性 (步态周期估计)
+- [x] 安全控制层 (PID + 加速度限制 + 二阶滤波)
+
+### 10.2 短期优化
 
 - [ ] DeepSORT-lite 集成：添加卡尔曼滤波预测
 - [ ] 负样本库：排除相似外观的非目标
 - [ ] 多人场景：支持多目标同时跟踪
+- [ ] MediaPipe 替换：训练 YOLOv5-Nano 多类别 (Person+Hand_Open+Hand_Fist)
 
-### 9.2 中期优化
+### 10.3 中期优化
 
 - [ ] 轻量 ReID 模型：训练 MobileNetV2-ReID 替代手工特征
 - [ ] 关键点跟踪：人脸关键点卡尔曼滤波
 - [ ] 遮挡处理：部分遮挡时的特征融合
+- [ ] 姿态辅助：利用骨骼关键点辅助跟踪
 
-### 9.3 长期优化 (S300 部署)
+### 10.4 长期优化 (S300 部署)
 
-- [ ] NPU 量化：Int8 量化部署
-- [ ] DSP 优化：颜色直方图计算迁移到 DSP
+- [ ] NPU 量化：全 INT8 量化部署
+- [ ] DSP 移植：颜色直方图/LBP 计算迁移到 DSP
+- [ ] 模型合并：人体+手势合并为单一模型
 - [ ] 功耗优化：动态调整检测频率
+- [ ] 云台接口：PWM/串口控制适配
 
 ---
 
-## 11. 参考资料
+## 11. S300 部署关键风险
+
+### 11.1 MediaPipe 无法在 NPU 运行 (Blocker)
+
+**问题**: MediaPipe Hands 包含大量自定义算子，不支持 S300 NPU。
+
+**解决方案**:
+| 方案 | 描述 | 工作量 |
+|------|------|--------|
+| **A (推荐)** | YOLOv5-Nano 多类别训练 (Person+Hand_Open+Hand_Fist) | 中等 |
+| B | Nanodet-Hand + 分类头 | 较大 |
+| C | 简化为按键触发 (无手势) | 很小 |
+
+### 11.2 ReID 算法计算载体
+
+**问题**: 颜色直方图/LBP 在 MCU 上非常慢。
+
+**解决方案**: 移植到 **DSP (SensPro 250)** 运行，利用向量指令集加速。
+
+### 11.3 模型量化精度
+
+**问题**: MobileFaceNet 需全 INT8 量化，可能损失精度。
+
+**解决方案**: 
+- 量化后验证余弦相似度
+- 如损失严重，最后一层切分到 DSP 以 FP32 运行
+
+### 11.4 串行推理延迟
+
+**问题**: 4 个模型串行可能导致 FPS < 10。
+
+**解决方案**:
+| 策略 | 效果 |
+|------|------|
+| 隔帧策略 | 人脸每 5 帧检测一次 |
+| ROI 优化 | 只在头部区域跑 SCRFD (128×128) |
+| 模型合并 | 人体+手势合并为一个模型 |
+
+---
+
+## 12. S300 部署架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        S300 部署流水线                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────┐    ┌──────────────────────────────────────────┐    │
+│  │ DVP摄像头 │───▶│ DSP: 图像预处理 (缩放/格式转换/归一化)    │    │
+│  └─────────┘    └──────────────────┬───────────────────────┘    │
+│                                    │                             │
+│                                    ▼                             │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ NPU: YOLOv5 (人体+手势检测，合并模型)                      │    │
+│  └──────────────────────────┬──────────────────────────────┘    │
+│                              │                                   │
+│          ┌───────────────────┼───────────────────┐               │
+│          ▼                   ▼                   ▼               │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐      │
+│  │MCU: 逻辑判断 │    │DSP: 裁剪ROI │    │DSP: ReID特征提取│      │
+│  │  (隔帧控制) │    │  (头部区域)  │    │ (颜色+LBP+几何) │      │
+│  └──────┬──────┘    └──────┬──────┘    └────────┬────────┘      │
+│         │                  │                    │                │
+│         │                  ▼                    │                │
+│         │         ┌─────────────┐               │                │
+│         │         │NPU: SCRFD   │               │                │
+│         │         │ (ROI人脸检测)│               │                │
+│         │         └──────┬──────┘               │                │
+│         │                │                      │                │
+│         │                ▼                      │                │
+│         │        ┌──────────────┐               │                │
+│         │        │NPU: MobileFace│               │                │
+│         │        │ (人脸识别)    │               │                │
+│         │        └──────┬───────┘               │                │
+│         │               │                       │                │
+│         ▼               ▼                       ▼                │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ MCU: 场景状态机 + 多视角匹配 + PID控制                     │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                              │                                   │
+│                              ▼                                   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ MCU: 输出控制信号 (云台PWM / 机器人轮速 / 无人机姿态)       │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 13. 参考资料
 
 1. YOLOv5: https://github.com/ultralytics/yolov5
 2. SCRFD: https://github.com/deepinsight/insightface
@@ -703,8 +1012,20 @@ examples/target_following/
 4. LBP: Local Binary Patterns for texture classification
 5. DeepSORT: https://github.com/nwojke/deep_sort
 6. MediaPipe Hands: https://developers.google.com/mediapipe/solutions/vision/hand_landmarker
+7. CLAHE: https://docs.opencv.org/master/d5/daf/tutorial_py_histogram_equalization.html
+8. PID Control: https://en.wikipedia.org/wiki/PID_controller
+9. Second-Order Systems: https://lpsa.swarthmore.edu/SecondOrderSystemsDynamics.html
+
+---
+
+## 14. 版本历史
+
+| 版本 | 日期 | 主要更新 |
+|------|------|----------|
+| v1.0 | 2025-12-16 | 初始版本：多视角特征库、运动一致性、自动学习 |
+| v2.0 | 2025-12-17 | 场景感知状态机、光照归一化、步态周期、安全控制层 |
 
 ---
 
 **文档维护**: AI Agent  
-**最后更新**: 2025-12-16
+**最后更新**: 2025-12-17
