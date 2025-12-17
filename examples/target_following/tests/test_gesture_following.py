@@ -75,6 +75,17 @@ MAX_VIEW_COUNT = 8  # 最多保存8个视角
 MIN_FACE_SIZE = 40  # 人脸最小边长(像素)
 MIN_FACE_SIZE_FOR_LEARN = 50  # 学习时人脸最小边长(更严格)
 
+# ============================================
+# 多帧投票机制 - 避免单帧误判
+# ============================================
+# 连续N帧未匹配才判定丢失，防止瞬时遮挡误判
+LOST_CONFIRM_FRAMES = 5  # 连续未匹配帧数才丢失 (默认 max_lost_frames=30)
+# 匹配结果缓冲 - 保存最近N帧的匹配情况用于投票
+MATCH_HISTORY_SIZE = 5  # 保存最近5帧匹配历史
+# 运动权重增益 - 多人场景下增加运动一致性权重
+MOTION_WEIGHT_MULTI_PERSON = 0.6  # 多人场景 motion 权重 (body:0.4, motion:0.6)
+MOTION_WEIGHT_SINGLE_PERSON = 0.5  # 单人场景 motion 权重 (body:0.5, motion:0.5)
+
 # 侧脸容忍度 - 侧脸角度下人脸embedding差异大，需要更信任运动连续性
 # 当运动连续性极高时（motion > 0.95），可以容忍较低的人脸相似度
 MOTION_TRUST_THRESHOLD = 0.95  # 运动连续性信任阈值
@@ -684,7 +695,13 @@ def main():
                             break
                     
                     # 计算 body + motion 综合分数
-                    body_motion_score = body_sim * 0.5 + motion_score * 0.5
+                    # 多人场景下增加 motion 权重，因为运动轨迹更可靠
+                    if is_multi_person_scene:
+                        motion_weight = MOTION_WEIGHT_MULTI_PERSON
+                    else:
+                        motion_weight = MOTION_WEIGHT_SINGLE_PERSON
+                    body_weight = 1.0 - motion_weight
+                    body_motion_score = body_sim * body_weight + motion_score * motion_weight
                     
                     # 判断匹配类型 (人脸有效 = 相似度高 且 尺寸够大)
                     face_matched = (face_sim is not None and 
@@ -745,20 +762,30 @@ def main():
             
             # 选择最佳匹配
             if all_person_matches:
-                # 简化策略: 优先选人脸匹配的，其次选body+motion匹配的
+                # 策略: 
+                #   1. 优先选人脸匹配的（身份最可靠）
+                #   2. 人脸匹配中优先选 motion 高的（轨迹最一致）
+                #   3. 其次选 body+motion 匹配的
+                #   4. body+motion 中多人场景优先选 motion 高的
                 # tuple: (idx, similarity, method, view, face_in_person, face_matched, face_sim, body_sim, motion_score, match_type)
                 matches_by_face = [m for m in all_person_matches if m[9] == "face"]  # m[9] = match_type
                 matches_by_body_motion = [m for m in all_person_matches if m[9] == "body_motion"]
                 
                 best_match = None
                 if matches_by_face:
-                    # 优先选人脸匹配的最高分
-                    best_match = max(matches_by_face, key=lambda x: x[6] if x[6] is not None else 0)  # 按face_sim排序
+                    # 人脸匹配中，优先选 motion 高的（轨迹一致性）
+                    # 排序依据: face_sim * 0.6 + motion * 0.4
+                    best_match = max(matches_by_face, key=lambda x: (x[6] if x[6] is not None else 0) * 0.6 + x[8] * 0.4)
                     if frame_count % 30 == 0 and len(all_person_matches) > 1:
-                        print(f"[DEBUG] 选择人脸匹配 Person[{best_match[0]}] (共{len(all_person_matches)}候选)")
+                        print(f"[DEBUG] 选择人脸匹配 Person[{best_match[0]}] (F:{best_match[6]:.2f}, M:{best_match[8]:.2f}, 共{len(all_person_matches)}候选)")
                 elif matches_by_body_motion:
-                    # 其次选body+motion匹配的最高分
-                    best_match = max(matches_by_body_motion, key=lambda x: x[7] * 0.5 + x[8] * 0.5)  # 按body+motion排序
+                    # body+motion 匹配中，多人场景强调 motion，单人场景平衡
+                    if is_multi_person_scene:
+                        # 多人: motion 优先（轨迹一致最重要）
+                        best_match = max(matches_by_body_motion, key=lambda x: x[8] * 0.7 + x[7] * 0.3)
+                    else:
+                        # 单人: 平衡 body 和 motion
+                        best_match = max(matches_by_body_motion, key=lambda x: x[7] * 0.5 + x[8] * 0.5)
                     if frame_count % 30 == 0:
                         print(f"[DEBUG] 选择body+motion匹配 Person[{best_match[0]}], B:{best_match[7]:.2f}, M:{best_match[8]:.2f}")
                 
