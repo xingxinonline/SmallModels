@@ -35,6 +35,12 @@ class EnhancedReIDConfig:
     # 几何特征
     use_geometry: bool = True
     
+    # ===== 光照归一化预处理 (新增) =====
+    use_illumination_normalization: bool = True  # 启用光照归一化
+    clahe_clip_limit: float = 2.0      # CLAHE 对比度限制
+    clahe_grid_size: int = 8           # CLAHE 网格大小
+    use_gray_world: bool = True        # 灰度世界白平衡
+    
     # 相似度权重
     color_weight: float = 0.5
     texture_weight: float = 0.3
@@ -91,7 +97,83 @@ class EnhancedReIDExtractor:
         print(f"       特征: 颜色({self.config.color_weight}) + "
               f"纹理({self.config.texture_weight}) + "
               f"几何({self.config.geometry_weight})")
+        print(f"       光照归一化: {self.config.use_illumination_normalization}")
+        
+        # 初始化 CLAHE
+        if self.config.use_illumination_normalization:
+            self._clahe = cv2.createCLAHE(
+                clipLimit=self.config.clahe_clip_limit,
+                tileGridSize=(self.config.clahe_grid_size, self.config.clahe_grid_size)
+            )
+        else:
+            self._clahe = None
+        
         return True
+    
+    def _normalize_illumination(self, image: np.ndarray) -> np.ndarray:
+        """光照归一化预处理
+        
+        步骤:
+        1. 灰度世界白平衡 (消除色偏)
+        2. CLAHE 自适应直方图均衡 (增强对比度)
+        3. LAB 空间亮度归一化
+        
+        Args:
+            image: BGR 图像
+            
+        Returns:
+            归一化后的 BGR 图像
+        """
+        if not self.config.use_illumination_normalization:
+            return image
+        
+        result = image.copy()
+        
+        # 1. 灰度世界白平衡
+        if self.config.use_gray_world:
+            result = self._gray_world_white_balance(result)
+        
+        # 2. LAB 空间 L 通道 CLAHE
+        if self._clahe is not None:
+            lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            l = self._clahe.apply(l)
+            lab = cv2.merge([l, a, b])
+            result = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        
+        return result
+    
+    def _gray_world_white_balance(self, image: np.ndarray) -> np.ndarray:
+        """灰度世界白平衡算法
+        
+        假设场景的平均颜色应该是灰色，校正色偏
+        """
+        # 计算各通道均值
+        b_mean = np.mean(image[:, :, 0])
+        g_mean = np.mean(image[:, :, 1])
+        r_mean = np.mean(image[:, :, 2])
+        
+        # 计算全局均值
+        gray_mean = (b_mean + g_mean + r_mean) / 3
+        
+        # 计算增益
+        if b_mean > 0 and g_mean > 0 and r_mean > 0:
+            b_gain = gray_mean / b_mean
+            g_gain = gray_mean / g_mean
+            r_gain = gray_mean / r_mean
+            
+            # 限制增益范围，避免过度校正
+            b_gain = np.clip(b_gain, 0.5, 2.0)
+            g_gain = np.clip(g_gain, 0.5, 2.0)
+            r_gain = np.clip(r_gain, 0.5, 2.0)
+            
+            result = image.astype(np.float32)
+            result[:, :, 0] = np.clip(result[:, :, 0] * b_gain, 0, 255)
+            result[:, :, 1] = np.clip(result[:, :, 1] * g_gain, 0, 255)
+            result[:, :, 2] = np.clip(result[:, :, 2] * r_gain, 0, 255)
+            return result.astype(np.uint8)
+        
+        return image
     
     @property
     def is_loaded(self) -> bool:
@@ -127,6 +209,9 @@ class EnhancedReIDExtractor:
         
         if crop_h < 20 or crop_w < 10:
             return None
+        
+        # ===== 光照归一化预处理 (新增) =====
+        person_crop = self._normalize_illumination(person_crop)
         
         # 分区
         parts = self._split_into_parts(person_crop)
