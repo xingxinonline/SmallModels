@@ -94,12 +94,63 @@ class GestureDetector:
             self._reset_gesture_counter()
             return GestureResult(GestureType.NONE, 0.0)
         
-        # 处理第一只检测到的手
-        hand_landmarks = results.multi_hand_landmarks[0]
-        handedness = results.multi_handedness[0].classification[0]
+        h, w = image.shape[:2]
+        
+        # ============================================
+        # 选择最佳的手：优先选择做出有效手势的手
+        # 而不是固定取第一只检测到的手
+        # ============================================
+        best_hand_idx = 0
+        best_gesture = GestureType.NONE
+        best_hand_size = 0
+        
+        for hand_idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
+            # 提取关键点
+            landmarks = np.array([
+                [lm.x * w, lm.y * h, lm.z] 
+                for lm in hand_landmarks.landmark
+            ])
+            
+            # 计算手的大小（用于优先选择大的手/近的手）
+            x_coords = landmarks[:, 0]
+            y_coords = landmarks[:, 1]
+            hand_size = (x_coords.max() - x_coords.min()) * (y_coords.max() - y_coords.min())
+            
+            # 识别这只手的手势
+            gesture_type = self._classify_gesture(landmarks)
+            
+            # 选择策略：
+            # 1. 优先选择做出有效手势（张开手掌/握拳）的手
+            # 2. 如果多只手都有有效手势，选择更大的手（更近的手）
+            # 3. 如果没有有效手势，选择最大的手
+            is_valid_gesture = gesture_type in (GestureType.OPEN_PALM, GestureType.CLOSED_FIST, 
+                                                 GestureType.VICTORY, GestureType.THUMB_UP)
+            best_is_valid = best_gesture in (GestureType.OPEN_PALM, GestureType.CLOSED_FIST,
+                                              GestureType.VICTORY, GestureType.THUMB_UP)
+            
+            should_update = False
+            if is_valid_gesture and not best_is_valid:
+                # 当前手有有效手势，之前的没有 → 选当前
+                should_update = True
+            elif is_valid_gesture and best_is_valid:
+                # 都有有效手势 → 选更大的
+                if hand_size > best_hand_size:
+                    should_update = True
+            elif not is_valid_gesture and not best_is_valid:
+                # 都没有有效手势 → 选更大的
+                if hand_size > best_hand_size:
+                    should_update = True
+            
+            if should_update:
+                best_hand_idx = hand_idx
+                best_gesture = gesture_type
+                best_hand_size = hand_size
+        
+        # 处理选中的手
+        hand_landmarks = results.multi_hand_landmarks[best_hand_idx]
+        handedness = results.multi_handedness[best_hand_idx].classification[0]
         
         # 提取关键点
-        h, w = image.shape[:2]
         landmarks = np.array([
             [lm.x * w, lm.y * h, lm.z] 
             for lm in hand_landmarks.landmark
