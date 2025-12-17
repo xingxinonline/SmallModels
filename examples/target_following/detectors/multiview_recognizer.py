@@ -280,6 +280,7 @@ class MultiViewConfig:
     # 自动学习
     auto_learn: bool = True
     learn_interval: float = 2.0  # 自动学习间隔 (秒)
+    max_views: int = 8  # 最大视角数量，防止特征库膨胀
     
     # 颜色权重 - 正面 (头部少)
     part_weights: List[float] = field(default_factory=lambda: [0.05, 0.15, 0.20, 0.20, 0.25, 0.15])

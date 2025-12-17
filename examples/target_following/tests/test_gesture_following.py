@@ -53,10 +53,12 @@ GESTURE_COOLDOWN_SECONDS = 3.0  # 触发后冷却秒数 (防止连续触发)
 FACE_ONLY_THRESHOLD = 0.70
 
 # 自动学习阈值
-# - 多人场景：需要人脸验证 + 高阈值
+# - 多人场景：需要人脸验证 + 高阈值（防止学习错误人脸）
 # - 单人场景：可放宽
-FACE_LEARN_THRESHOLD = 0.65  # 人脸匹配学习阈值 (降低以提高学习率)
-BODY_LEARN_THRESHOLD = 0.60  # 人体匹配学习阈值（单人场景）
+# 关键修复：0.65 太低会在多人场景学习到他人人脸，导致目标切换
+FACE_LEARN_THRESHOLD = 0.72  # 人脸匹配学习阈值 (提高以防止学习错误人脸)
+FACE_LEARN_THRESHOLD_MULTI = 0.78  # 多人场景下的人脸学习阈值（更严格）
+BODY_LEARN_THRESHOLD = 0.68  # 人体匹配学习阈值（提高）
 
 # 重新锁定阈值 - 从丢失状态恢复需要更高信心
 RELOCK_FACE_THRESHOLD = 0.70  # 降低以便更容易重新锁定
@@ -65,6 +67,14 @@ RELOCK_FACE_THRESHOLD = 0.70  # 降低以便更容易重新锁定
 # 重新锁定需要连续N帧都匹配成功才确认
 RELOCK_CONFIRM_FRAMES = 2  # 连续帧数要求 (从3降到2)
 AUTO_LEARN_CONFIRM_FRAMES = 1  # 自动学习不需要连续帧（高置信度时直接学习）
+
+# 视角库最大容量 - 防止特征库无限膨胀
+MAX_VIEW_COUNT = 8  # 最多保存8个视角
+
+# 侧脸容忍度 - 侧脸角度下人脸embedding差异大，需要更信任运动连续性
+# 当运动连续性极高时（motion > 0.95），可以容忍较低的人脸相似度
+MOTION_TRUST_THRESHOLD = 0.95  # 运动连续性信任阈值
+FACE_SIDE_VIEW_MIN = 0.35  # 侧脸最低接受阈值（配合高运动连续性）
 
 
 def extract_view_feature(
@@ -284,15 +294,16 @@ def main():
     mv_config = MultiViewConfig(
         face_weight=0.6,
         body_weight=0.4,
-        face_threshold=0.65,      # 提高人脸阈值，防止误匹配
-        body_threshold=0.60,      # 人体阈值
-        fused_threshold=0.55,     # 融合阈值
-        motion_weight=0.10,       # 降低运动权重
+        face_threshold=0.60,      # 人脸阈值（适度降低以容忍侧脸）
+        body_threshold=0.58,      # 人体阈值（适度降低以提高连续性）
+        fused_threshold=0.52,     # 融合阈值（适度降低）
+        motion_weight=0.15,       # 提高运动权重（侧脸时依赖运动连续性）
         auto_learn=True,
         learn_interval=3.0,       # 学习间隔
         smooth_window=5,
         confirm_threshold=3,
-        part_weights=[0.05, 0.12, 0.20, 0.20, 0.25, 0.18]
+        part_weights=[0.05, 0.12, 0.20, 0.20, 0.25, 0.18],
+        max_views=MAX_VIEW_COUNT  # 限制视角数量
     )
     mv_recognizer = MultiViewRecognizer(mv_config)
     
@@ -633,22 +644,43 @@ def main():
                     face_in_person = view.has_face and view.face_embedding is not None
                     face_verified = 'face_priority' in method or 'fused' in method
                     
+                    # 提取运动连续性分数（从 method 字符串中解析或使用默认值）
+                    motion_score = details.get('motion_sim', 0.0)
+                    if 'M:' in method:
+                        try:
+                            motion_str = method.split('M:')[1].split(')')[0].split(' ')[0]
+                            motion_score = float(motion_str)
+                        except:
+                            pass
+                    
                     # ============================================
                     # 关键保护逻辑（防止误跟踪他人）
                     # ============================================
                     # 分两种情况：
                     # Case 1: 目标有脸 + 候选有脸 + 人脸验证失败 → 可能是其他人
                     # Case 2: 目标有脸 + 候选无脸 → 可能是目标背面或其他人背面
+                    # 
+                    # 新增：侧脸容忍机制
+                    # - 当运动连续性极高 (motion > 0.95) 时，允许较低的人脸相似度
+                    # - 这解决了用户转头/侧脸时被误拒绝的问题
                     
                     FACE_REJECT_THRESHOLD = 0.40   # 低于此值明确拒绝
-                    FACE_UNCERTAIN_THRESHOLD = 0.65  # 人脸验证阈值
-                    HIGH_BODY_TRUST_THRESHOLD = 0.85  # body 超高时信任
+                    FACE_UNCERTAIN_THRESHOLD = 0.60  # 人脸验证阈值（降低以容忍侧脸）
+                    HIGH_BODY_TRUST_THRESHOLD = 0.82  # body 高时信任
                     BACK_VIEW_BODY_THRESHOLD = 0.70  # 目标有脸但候选无脸时的body阈值
+                    
+                    # 侧脸容忍：运动连续性极高时放宽人脸要求
+                    high_motion_trust = motion_score >= MOTION_TRUST_THRESHOLD
                     
                     # Case 1: 目标有脸 + 候选有脸 + 人脸验证失败
                     if target_has_face and face_in_person and not face_verified:
                         if face_sim is not None:
-                            if face_sim < FACE_REJECT_THRESHOLD:
+                            # 侧脸容忍：运动连续性极高 + 人脸不是完全不匹配 → 信任运动
+                            if high_motion_trust and face_sim >= FACE_SIDE_VIEW_MIN and is_single_person_scene:
+                                if frame_count % 30 == 0:
+                                    print(f"[DEBUG] Person[{idx}] 侧脸容忍: F:{face_sim:.2f}>={FACE_SIDE_VIEW_MIN}, M:{motion_score:.2f}>={MOTION_TRUST_THRESHOLD}, 信任运动")
+                                # 通过，继续处理
+                            elif face_sim < FACE_REJECT_THRESHOLD:
                                 # 人脸相似度太低，明确是另一个人
                                 if frame_count % 30 == 0:
                                     print(f"[DEBUG] Person[{idx}] 人脸明确不匹配({face_sim:.2f}<{FACE_REJECT_THRESHOLD}), 拒绝")
@@ -657,7 +689,7 @@ def main():
                                 # 人脸不确定，需要 body 非常高才能信任
                                 if body_sim >= HIGH_BODY_TRUST_THRESHOLD:
                                     if frame_count % 30 == 0:
-                                        print(f"[DEBUG] Person[{idx}] 人脸不确定({face_sim:.2f})但body极高({body_sim:.2f}>={HIGH_BODY_TRUST_THRESHOLD}), 信任body")
+                                        print(f"[DEBUG] Person[{idx}] 人脸不确定({face_sim:.2f})但body高({body_sim:.2f}>={HIGH_BODY_TRUST_THRESHOLD}), 信任body")
                                     # 继续处理
                                 else:
                                     if frame_count % 30 == 0:
@@ -754,14 +786,21 @@ def main():
                     # 自动学习策略 - 分场景处理
                     # 核心原则：多人场景需要人脸验证，单人场景可以更宽松
                     # 关键保护：多人场景下仅靠body匹配时，禁止学习！
+                    # 新增保护：限制视角库容量，防止特征膨胀污染
                     should_learn = False
                     learn_reason = ""
                     target_has_body = (mv_recognizer.target is not None and 
                                        any(v.has_body for v in mv_recognizer.target.view_features))
                     # 使用外层统一定义的 is_single_person_scene / is_multi_person_scene
                     
+                    # 容量检查：视角库已满时停止学习
+                    current_view_count = mv_recognizer.target.num_views if mv_recognizer.target else 0
+                    if current_view_count >= MAX_VIEW_COUNT:
+                        if frame_count % 60 == 0:
+                            print(f"[DEBUG] 视角库已满({current_view_count}>={MAX_VIEW_COUNT})，停止学习")
+                        should_learn = False
                     # 多人场景 + 目标有人脸 + 没有人脸验证 = 禁止学习
-                    if is_multi_person_scene and target_has_face and not face_verified:
+                    elif is_multi_person_scene and target_has_face and not face_verified:
                         # 多人场景下仅靠body匹配，不学习，防止污染特征库
                         if frame_count % 30 == 0:
                             print(f"[DEBUG] 多人场景无人脸验证，禁止学习 Person[{idx}]")
@@ -770,15 +809,18 @@ def main():
                         # 使用已获取的 face_sim（无需再次解析 method 字符串）
                         face_sim_for_learn = match_face_sim if match_face_sim is not None else 0.0
                         
+                        # 根据场景选择学习阈值
+                        current_face_learn_threshold = FACE_LEARN_THRESHOLD_MULTI if is_multi_person_scene else FACE_LEARN_THRESHOLD
+                        
                         # 策略1：有人脸验证时直接学习（不需要连续帧）
-                        if face_in_person and face_sim_for_learn >= FACE_LEARN_THRESHOLD:
+                        if face_in_person and face_sim_for_learn >= current_face_learn_threshold:
                             # 人脸在人体框内 + 人脸相似度高 -> 直接学习
                             if not target_has_body and view.has_body:
                                 should_learn = True
-                                learn_reason = f"补充人体(F:{face_sim_for_learn:.2f}>={FACE_LEARN_THRESHOLD})"
+                                learn_reason = f"补充人体(F:{face_sim_for_learn:.2f}>={current_face_learn_threshold})"
                             else:
                                 should_learn = True
-                                learn_reason = f"人脸验证(F:{face_sim_for_learn:.2f}>={FACE_LEARN_THRESHOLD})"
+                                learn_reason = f"人脸验证(F:{face_sim_for_learn:.2f}>={current_face_learn_threshold})"
                         
                         # 策略2：目标没有人脸特征时，用body相似度学习
                         # 这种情况发生在：从背面启动跟随，之后转身等
@@ -792,8 +834,7 @@ def main():
                         # 关键保护：必须是严格的单人场景（persons<=1 且 faces<=1）
                         elif is_single_person_scene and not face_in_person and target_has_body and similarity >= BODY_LEARN_THRESHOLD:
                             # 单人场景 + 没检测到人脸 + body匹配度高 -> 可能是背面，学习
-                            # 进一步降低背面学习阈值，单人场景风险非常低
-                            BACK_VIEW_LEARN_THRESHOLD = 0.60  # 背面学习阈值（从0.68进一步降低）
+                            BACK_VIEW_LEARN_THRESHOLD = 0.70  # 背面学习阈值（提高以防误学习）
                             if target_has_face and similarity < BACK_VIEW_LEARN_THRESHOLD:
                                 # 目标有人脸但当前没检测到人脸，需要稍高置信度
                                 if frame_count % 15 == 0:
