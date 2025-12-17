@@ -497,8 +497,9 @@ class MultiViewRecognizer:
         self,
         candidate: ViewFeature,
         candidate_bbox: np.ndarray,
-        update_history: bool = False  # 是否更新时域平滑历史
-    ) -> Tuple[bool, float, str]:
+        update_history: bool = False,  # 是否更新时域平滑历史
+        return_details: bool = False  # 是否返回详细信息
+    ) -> Tuple[bool, float, str] | Tuple[bool, float, str, dict]:
         """
         判断是否为同一目标 (可选时域平滑)
         
@@ -506,6 +507,11 @@ class MultiViewRecognizer:
             candidate: 候选特征
             candidate_bbox: 候选边界框
             update_history: 是否更新匹配历史（只有最终选定的匹配才应该更新）
+            return_details: 是否返回详细信息（包含 face_sim, body_sim 等）
+        
+        Returns:
+            (is_match, similarity, method) 或
+            (is_match, similarity, method, details) 如果 return_details=True
         """
         similarity, method, details = self.compute_similarity(candidate, candidate_bbox)
         
@@ -529,9 +535,13 @@ class MultiViewRecognizer:
             else:
                 smoothed_match = is_match
             
+            if return_details:
+                return smoothed_match, similarity, method, details
             return smoothed_match, similarity, method
         else:
             # 不更新历史，直接返回原始结果
+            if return_details:
+                return is_match, similarity, method, details
             return is_match, similarity, method
     
     def clear_match_history(self):
