@@ -87,10 +87,11 @@ class CameraConfig:
 @dataclass
 class GestureConfig:
     """手势识别配置"""
-    # MediaPipe 配置
-    max_num_hands: int = 1
-    min_detection_confidence: float = 0.7
-    min_tracking_confidence: float = 0.5
+    # MediaPipe 配置 (优化性能)
+    max_num_hands: int = 1          # 只检测1只手
+    min_detection_confidence: float = 0.6  # 降低检测阈值 [0.7→0.6]
+    min_tracking_confidence: float = 0.4   # 降低跟踪阈值 [0.5→0.4]
+    model_complexity: int = 0       # 模型复杂度 [0=Lite最快, 1=Full]
     
     # 手势确认帧数 (防止误触发) - 旧参数，保留兼容
     gesture_confirm_frames: int = 5
