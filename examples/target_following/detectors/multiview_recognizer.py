@@ -338,8 +338,8 @@ class MultiViewConfig:
     
     # 运动一致性
     motion_weight: float = 0.15  # 运动一致性权重
-    max_motion_distance: float = 150  # 最大位移 (像素)
-    motion_time_window: float = 0.5  # 时间窗口 (秒)
+    max_motion_distance: float = 250  # 最大位移 (像素) - 增大以支持快速移动/低帧率
+    motion_time_window: float = 3.0  # 时间窗口 (秒) - 增大以应对低FPS场景
     
     # 多人场景保护
     require_face_body_consistency: bool = True  # 人脸-人体一致性检查
@@ -559,12 +559,25 @@ class MultiViewRecognizer:
                 pred_y = y2 + vy * predict_dt
                 
                 distance = np.sqrt((cx - pred_x)**2 + (cy - pred_y)**2)
-                return max(0, 1 - distance / self.config.max_motion_distance)
+                # ★★★ 改进：使用更平缓的衰减曲线 ★★★
+                # 原来：超过 max_distance 就归零
+                # 现在：使用 sigmoid-like 衰减，即使距离较大也保留部分 motion 分数
+                # 这样快速移动时不会完全丢失 motion 信息
+                ratio = distance / self.config.max_motion_distance
+                if ratio <= 1.0:
+                    return 1.0 - ratio  # 线性衰减到0
+                else:
+                    # 超过阈值后，给一个小的基础分（0.1-0.2之间，随距离增加而减小）
+                    return max(0.05, 0.20 - (ratio - 1.0) * 0.15)
         
         # 只有一个点，用距离
         x, y, t = recent_positions[-1]
         distance = np.sqrt((cx - x)**2 + (cy - y)**2)
-        return max(0, 1 - distance / self.config.max_motion_distance)
+        ratio = distance / self.config.max_motion_distance
+        if ratio <= 1.0:
+            return 1.0 - ratio
+        else:
+            return max(0.05, 0.20 - (ratio - 1.0) * 0.15)
     
     def is_same_target(
         self,

@@ -144,7 +144,7 @@ class EnhancedReIDExtractor:
         return result
     
     def _gray_world_white_balance(self, image: np.ndarray) -> np.ndarray:
-        """灰度世界白平衡算法
+        """灰度世界白平衡算法 (LUT加速版)
         
         假设场景的平均颜色应该是灰色，校正色偏
         """
@@ -167,11 +167,17 @@ class EnhancedReIDExtractor:
             g_gain = np.clip(g_gain, 0.5, 2.0)
             r_gain = np.clip(r_gain, 0.5, 2.0)
             
-            result = image.astype(np.float32)
-            result[:, :, 0] = np.clip(result[:, :, 0] * b_gain, 0, 255)
-            result[:, :, 1] = np.clip(result[:, :, 1] * g_gain, 0, 255)
-            result[:, :, 2] = np.clip(result[:, :, 2] * r_gain, 0, 255)
-            return result.astype(np.uint8)
+            # 使用 LUT 加速 (避免 float32 转换和逐像素乘法)
+            lut_b = np.clip(np.arange(256) * b_gain, 0, 255).astype(np.uint8)
+            lut_g = np.clip(np.arange(256) * g_gain, 0, 255).astype(np.uint8)
+            lut_r = np.clip(np.arange(256) * r_gain, 0, 255).astype(np.uint8)
+            
+            channels = list(cv2.split(image))  # 转换为 list 以便修改
+            channels[0] = cv2.LUT(channels[0], lut_b)
+            channels[1] = cv2.LUT(channels[1], lut_g)
+            channels[2] = cv2.LUT(channels[2], lut_r)
+            
+            return cv2.merge(channels)
         
         return image
     
@@ -209,6 +215,13 @@ class EnhancedReIDExtractor:
         
         if crop_h < 20 or crop_w < 10:
             return None
+        
+        # 性能优化：将大图缩放到固定宽度 (128px)，加速直方图和LBP计算
+        # 对于颜色和纹理特征，128px 宽度已经足够保留大部分信息
+        if crop_w > 128:
+            scale = 128 / crop_w
+            new_h = int(crop_h * scale)
+            person_crop = cv2.resize(person_crop, (128, new_h))
         
         # ===== 光照归一化预处理 (新增) =====
         person_crop = self._normalize_illumination(person_crop)

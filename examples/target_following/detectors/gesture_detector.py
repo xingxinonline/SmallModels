@@ -58,14 +58,20 @@ class GestureDetector:
         try:
             import mediapipe as mp
             self.mp_hands = mp.solutions.hands
+            
+            # 获取 model_complexity，默认为0 (Lite模型，最快)
+            model_complexity = getattr(self.config, 'model_complexity', 0)
+            
             self.hands = self.mp_hands.Hands(
                 static_image_mode=False,
                 max_num_hands=self.config.max_num_hands,
+                model_complexity=model_complexity,  # 0=Lite, 1=Full
                 min_detection_confidence=self.config.min_detection_confidence,
                 min_tracking_confidence=self.config.min_tracking_confidence
             )
             self._is_loaded = True
-            print("[INFO] 手势检测器已加载 (MediaPipe Hands)")
+            complexity_name = "Lite" if model_complexity == 0 else "Full"
+            print(f"[INFO] 手势检测器已加载 (MediaPipe Hands, {complexity_name}模型)")
             return True
         except Exception as e:
             print(f"[ERROR] 手势检测器加载失败: {e}")
