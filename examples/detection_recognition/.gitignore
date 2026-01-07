@@ -1,0 +1,7 @@
+*.avi
+others/
+pic/
+performance/
+__pycache__/
+model/__pycache__/
+model/.ipynb_checkpoints/
